@@ -20,7 +20,8 @@ STATUS = {"join me": ("🔵", 0x3498DB), "active": ("🟢", 0x2ECC71),
           "ask me": ("🟠", 0xE67E22), "busy": ("🔴", 0xE74C3C), "offline": ("⚫", 0x95A5A6)}
 
 def parse_location(loc):
-    """location文字列 -> (world_id, instance_id, type_label, region) / 特殊値はNone"""
+    """location文字列 -> (world_id, instance_id, type_label, region, owner) / 特殊値はNone
+    owner = ("grp"|"usr", id) / Publicなどオーナーなしは None"""
     if not loc or loc in ("offline", "private", "traveling") or ":" not in loc:
         return None
     wid, rest = loc.split(":", 1)
@@ -33,7 +34,12 @@ def parse_location(loc):
     elif "friends" in t: label = "Friends"
     elif "private" in t: label = "Invite+" if "canRequestInvite" in t else "Invite"
     else: label = "Public"
-    return wid, rest, label, region
+    owner = None
+    if t.get("group"): owner = ("grp", t["group"])
+    else:
+        for k in ("hidden", "friends", "private"):
+            if t.get(k): owner = ("usr", t[k]); break
+    return wid, rest, label, region, owner
 
 def slug(name, uid):
     s = re.sub(r"[^\w\-]+", "-", name.lower()).strip("-")
@@ -45,6 +51,7 @@ class Bot(commands.Bot):
         self.db = DB()
         self.vrc = VRC(os.environ["VRC_USERNAME"], os.environ["VRC_PASSWORD"], UA)
         self.last_loc, self.last_status, self.world_cache = {}, {}, {}
+        self.owner_cache = {}  # id -> (取得時刻, 名前 or None)
 
     async def setup_hook(self):
         self.tree.add_command(FriendGroup(self), guild=discord.Object(GUILD_ID))
@@ -82,12 +89,29 @@ class Bot(commands.Bot):
         if ch: await ch.send(**kw)
 
     # ---------- world info ----------
+    async def owner_name(self, kind, oid):
+        """インスタンスオーナー名。ユーザー=表示名 / グループ=グループ名。1時間キャッシュ(失敗時は5分)。"""
+        c = self.owner_cache.get(oid)
+        if c and time.time() - c[0] < (3600 if c[1] else 300):
+            return c[1] or "取得不可"
+        name = None
+        row = kind == "usr" and self.db.get(oid)
+        if row: name = row["name"]  # 登録済みフレンドならAPI不要
+        else:
+            try:
+                if kind == "grp": name = await asyncio.to_thread(self.vrc.get_group_name, oid)
+                else: name = (await asyncio.to_thread(self.vrc.get_user, oid))["name"]
+            except Exception as e:
+                log.warning("owner lookup failed %s: %s", oid, e)
+        self.owner_cache[oid] = (time.time(), name)
+        return name or "取得不可"
+
     async def world_embed_fields(self, loc, embed):
         p = parse_location(loc)
         if not p:
             embed.add_field(name="場所", value="Private / 取得不可" if loc in ("private", None, "") else loc)
             return
-        wid, iid, label, region = p
+        wid, iid, label, region, owner = p
         w = self.world_cache.get(wid)
         if not w or time.time() - w[0] > 1800:
             try: w = (time.time(), await asyncio.to_thread(self.vrc.get_world, wid))
@@ -102,8 +126,10 @@ class Bot(commands.Bot):
             embed.add_field(name="人数", value=f"{i['n_users']}/{cap}")
         except Exception:
             embed.add_field(name="人数", value="取得不可")
+        if owner:
+            name = await self.owner_name(*owner)
+            embed.add_field(name="オーナー", value=f"{name} (グループ)" if owner[0] == "grp" else name)
         if info:
-            embed.add_field(name="作者", value=info["author"])
             if info["thumb"]: embed.set_thumbnail(url=info["thumb"])
             if info["desc"]: embed.add_field(name="説明", value=info["desc"], inline=False)
 

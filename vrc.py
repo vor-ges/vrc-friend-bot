@@ -1,6 +1,6 @@
 import os, re, asyncio, vrchatapi
 from urllib.parse import urlparse
-from vrchatapi.api import authentication_api, users_api, worlds_api, instances_api
+from vrchatapi.api import authentication_api, users_api, worlds_api, instances_api, groups_api
 from vrchatapi.exceptions import UnauthorizedException
 from vrchatapi.models.two_factor_auth_code import TwoFactorAuthCode
 from vrchatapi.models.two_factor_email_code import TwoFactorEmailCode
@@ -58,6 +58,7 @@ class VRC:
         self.users = users_api.UsersApi(self.api)
         self.worlds = worlds_api.WorldsApi(self.api)
         self.instances = instances_api.InstancesApi(self.api)
+        self.groups = groups_api.GroupsApi(self.api)
         self.token = None
 
     def login(self):
@@ -110,3 +111,6 @@ class VRC:
     def get_instance(self, wid, iid):
         i = self.instances.get_instance(wid, iid)
         return {"n_users": getattr(i, "n_users", None), "capacity": getattr(i, "capacity", None)}
+
+    def get_group_name(self, gid):
+        return self.groups.get_group(gid).name

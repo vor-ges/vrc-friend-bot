@@ -41,3 +41,38 @@ assert g.resolve(uid(99))[0] is None and g.resolve(uid(500))[0] is None
 assert "複数" in g.resolve("alice")[1] and g.resolve("user7")[0]["uid"] == uid(7)
 lv = B.ListView(db.active(), True); assert lv.pages == 4 and len(lv.embed().description) < 4096
 print("ALL TESTS PASSED")
+
+# --- インスタンスオーナー表示 ---
+W = "wrld_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+assert B.parse_location(f"{W}:123")[4] is None  # Public: オーナーなし
+assert B.parse_location(f"{W}:123~hidden(usr_x)~region(jp)")[2:] == ("Friends+", "jp", ("usr", "usr_x"))
+assert B.parse_location(f"{W}:123~friends(usr_x)~region(us)")[4] == ("usr", "usr_x")
+assert B.parse_location(f"{W}:123~private(usr_x)~canRequestInvite~region(jp)")[2:4] == ("Invite+", "jp")
+assert B.parse_location(f"{W}:123~group(grp_y)~groupAccessType(plus)~region(jp)")[2:] == ("Group+", "jp", ("grp", "grp_y"))
+
+class FakeVRC:
+    calls = 0
+    def get_world(s, w): return {"name": "W", "author": "AUTHOR", "capacity": 32, "thumb": None, "desc": "d"}
+    def get_instance(s, w, i): return {"n_users": 5, "capacity": 16}
+    def get_user(s, u): s.calls += 1; return {"name": "OwnerUser"}
+    def get_group_name(s, g): s.calls += 1; return "MyGroup"
+import discord
+async def embed_for(loc, bot):
+    e = discord.Embed(); await bot.world_embed_fields(loc, e)
+    return {f.name: f.value for f in e.fields}
+async def run2():
+    bot = B.Bot(); bot.vrc = FakeVRC(); bot.db = DB(":memory:")
+    f = await embed_for(f"{W}:1~group(grp_y)~groupAccessType(members)~region(jp)", bot)
+    assert f["オーナー"] == "MyGroup (グループ)" and "作者" not in f, f
+    f = await embed_for(f"{W}:1~hidden(usr_o)~region(jp)", bot)
+    assert f["オーナー"] == "OwnerUser" and f["インスタンス"] == "Friends+ (JP)" and f["人数"] == "5/16", f
+    await embed_for(f"{W}:1~hidden(usr_o)~region(jp)", bot)
+    assert bot.vrc.calls == 2  # キャッシュでAPI再呼び出しなし
+    bot.db.upsert("usr_known", "KnownFriend", 1)
+    assert (await embed_for(f"{W}:1~friends(usr_known)", bot))["オーナー"] == "KnownFriend"  # 登録済みはAPI不要
+    assert bot.vrc.calls == 2
+    assert "オーナー" not in await embed_for(f"{W}:1", bot)  # Public
+    bot.vrc.get_user = lambda u: (_ for _ in ()).throw(RuntimeError("x"))
+    assert (await embed_for(f"{W}:1~private(usr_fail)", bot))["オーナー"] == "取得不可"
+asyncio.run(run2())
+print("OWNER TESTS PASSED")
