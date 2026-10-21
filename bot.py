@@ -52,6 +52,7 @@ class Bot(commands.Bot):
         self.vrc = VRC(os.environ["VRC_USERNAME"], os.environ["VRC_PASSWORD"], UA)
         self.last_loc, self.last_status, self.world_cache = {}, {}, {}
         self.owner_cache = {}  # id -> (取得時刻, 名前 or None)
+        self.ingame = set()    # 現在VRChat(ゲーム内)にログイン中と判断しているUID
 
     async def setup_hook(self):
         self.tree.add_command(FriendGroup(self), guild=discord.Object(GUILD_ID))
@@ -65,10 +66,16 @@ class Bot(commands.Bot):
             await self.snapshot(f["uid"])
             await asyncio.sleep(1.5)
 
+    def seed(self, uid, u):
+        """get_userの結果から、ステータスと「ゲーム内にいるか」を復元 (state: online=ゲーム内 / active=Webのみ)"""
+        self.last_status[uid] = (u["status"], u["desc"])
+        if u.get("state") == "online": self.ingame.add(uid)
+        else: self.ingame.discard(uid)
+
     async def snapshot(self, uid):
         try:
             u = await asyncio.to_thread(self.vrc.get_user, uid)
-            self.last_status[uid] = (u["status"], u["desc"])
+            self.seed(uid, u)
             return u
         except Exception as e:
             log.warning("snapshot %s failed: %s", uid, e)
@@ -155,25 +162,34 @@ class Bot(commands.Bot):
             try: c = json.loads(c)
             except Exception: return
         if not isinstance(c, dict): return
-        uid = c.get("userId")
+        uid = c.get("userId") or c.get("userid")  # friend-active だけキー名が小文字
         row = uid and self.db.get(uid)
         if not row or not row["active"]: return
         name = row["name"]
         user = c.get("user") or {}
         platform = c.get("platform", "")
 
+        # VRChatは「ゲーム内ログイン=friend-online」「Web=friend-active」と別イベントで送る一方、
+        # friend-offline はどちらの離脱でも届く。ゲームに入っていた人の離脱だけを通知する。
         if t == "friend-online":
+            if platform == "web": return
+            self.ingame.add(uid)
             e = discord.Embed(title=f"🟢 {name} がオンライン", color=0x2ECC71)
             if platform: e.add_field(name="プラットフォーム", value=platform)
             loc = c.get("location") or (user.get("location"))
             self.last_loc[uid] = loc
             await self.world_embed_fields(loc, e)
             await self.send_to(uid, content=f"<@{OWNER}>", embed=e)  # メンションはオンラインのみ
-        elif t == "friend-offline":
+        elif t in ("friend-offline", "friend-active"):
+            # friend-active(Webのみ)は、ゲームを終了してWebだけ残った場合も含むので「ゲームから抜けた」扱い
             self.last_loc.pop(uid, None)
+            if uid not in self.ingame: return  # Webの入退室など、ゲームに入っていない人の離脱は通知しない
+            self.ingame.discard(uid)
             await self.send_to(uid, embed=discord.Embed(title=f"⚫ {name} がオフライン", color=0x95A5A6))
         elif t == "friend-location":
             loc = c.get("location")
+            if not loc or loc == "offline": return
+            self.ingame.add(uid)  # 実在の場所を持つ=ゲーム内(オンライン通知を取りこぼしていても復元)
             if loc == "traveling" or loc == self.last_loc.get(uid): return
             self.last_loc[uid] = loc
             e = discord.Embed(title=f"🚪 {name} が移動", color=0x3498DB)
@@ -334,7 +350,7 @@ class FriendGroup(app_commands.Group):
                 log.exception("add: channel creation failed uid=%s", uid)
                 return await i.followup.send(f"❌ チャンネル作成に失敗しました (Botの権限を確認): {e.status}")
             self.bot.db.upsert(uid, u["name"], ch.id)
-        self.bot.last_status[uid] = (u["status"], u["desc"])
+        self.bot.seed(uid, u)
         log.info("friend added by=%s uid=%s name=%s rejoin=%s", i.user.id, uid, u["name"], bool(existing))
         warn = "" if u["is_friend"] else "\n⚠️ このアカウントとフレンドではないため、通知は届きません。"
         e = discord.Embed(title="➕ メンバー追加" + ("(再登録)" if existing else ""),

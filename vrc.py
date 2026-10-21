@@ -101,7 +101,8 @@ class VRC:
     def get_user(self, uid):
         u = self.users.get_user(uid)
         return {"name": u.display_name, "status": str(u.status),
-                "desc": u.status_description or "", "is_friend": bool(u.is_friend)}
+                "desc": u.status_description or "", "is_friend": bool(u.is_friend),
+                "state": str(u.state or "")}
 
     def get_world(self, wid):
         w = self.worlds.get_world(wid)

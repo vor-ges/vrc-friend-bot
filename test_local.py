@@ -76,3 +76,41 @@ async def run2():
     assert (await embed_for(f"{W}:1~private(usr_fail)", bot))["オーナー"] == "取得不可"
 asyncio.run(run2())
 print("OWNER TESTS PASSED")
+
+# --- ゲーム内/Webの区別 (オフライン連続通知の防止) ---
+async def run3():
+    bot = B.Bot(); bot.vrc = FakeVRC(); bot.db = DB(":memory:")
+    bot.db.upsert("usr_a", "Alice", 1)
+    sent = []
+    async def fake_send(uid, **kw): sent.append(kw["embed"].title)
+    bot.send_to = fake_send
+    P = f"{W}:1~friends(usr_o)~region(jp)"
+    ev = lambda t, **c: bot.handle({"type": t, "content": {"userId": "usr_a", **c}})
+    async def case(label, steps, expect):
+        sent.clear(); bot.ingame.clear(); bot.last_loc.clear()
+        for s in steps: await s
+        assert sent == expect, (label, sent)
+    ON, OFF = "🟢 Alice がオンライン", "⚫ Alice がオフライン"
+    await case("Webだけ(active→offline)", [ev("friend-active", platform="web"), ev("friend-offline")], [])
+    await case("ゲーム→offline→offline", [ev("friend-online", platform="standalonewindows", location=P), ev("friend-offline"), ev("friend-offline")], [ON, OFF])
+    await case("Web→ゲーム→offline→Web offline", [ev("friend-active", platform="web"), ev("friend-online", platform="android", location="private"),
+               ev("friend-offline"), ev("friend-offline")], [ON, OFF])
+    await case("ゲーム終了しWebだけ残る", [ev("friend-online", platform="standalonewindows", location="private"), ev("friend-active", platform="web"), ev("friend-offline")], [ON, OFF])
+    await case("friend-onlineがweb", [ev("friend-online", platform="web"), ev("friend-offline")], [])
+    await case("location offlineは無視", [ev("friend-location", location="offline"), ev("friend-offline")], [])
+    # active のキーが小文字 userid でも処理できる
+    sent.clear(); bot.ingame.add("usr_a")
+    await bot.handle({"type": "friend-active", "content": json.dumps({"userid": "usr_a", "platform": "web"})})
+    assert len(sent) == 1 and "usr_a" not in bot.ingame
+    # 場所だけ届いた(online取りこぼし)場合もゲーム内として復元され、後のofflineが通知される
+    sent.clear(); bot.ingame.clear(); bot.last_loc.clear()
+    await ev("friend-location", location=P); await ev("friend-offline")
+    assert sent == ["🚪 Alice が移動", "⚫ Alice がオフライン"], sent
+    # 起動時のseed: state=online ならゲーム内、active/offline ならそうでない
+    bot.ingame.clear(); bot.seed("usr_a", {"status": "active", "desc": "", "state": "online"}); assert "usr_a" in bot.ingame
+    bot.seed("usr_a", {"status": "active", "desc": "", "state": "active"}); assert "usr_a" not in bot.ingame
+    sent.clear(); bot.seed("usr_a", {"status": "active", "desc": "", "state": "online"}); await ev("friend-offline")
+    assert len(sent) == 1
+import json
+asyncio.run(run3())
+print("INGAME TESTS PASSED")
