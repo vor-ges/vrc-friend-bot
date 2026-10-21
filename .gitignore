@@ -1,0 +1,16 @@
+
+# Bot tokens: never upload these files
+/bot_token.txt
+/bot_token-al.txt
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Local logs
+*.log
