@@ -1,7 +1,6 @@
 
 # Bot tokens: never upload these files
 /bot_token.txt
-/bot_token-al.txt
 
 # Local environment and secrets
 .env
