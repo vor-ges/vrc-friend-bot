@@ -31,6 +31,9 @@ discordのbotを用いて、
 
 なお、Webのログインはオンライン・オフラインの範疇外としています。
 
+## How to use
+後々記載します。  
+
 ## Reference
 Claude Code Free Plan(?  
 
