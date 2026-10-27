@@ -1,10 +1,13 @@
 import os, re, json, time, asyncio, logging
+from datetime import datetime
+from typing import Optional
 import discord, websockets
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 from db import DB
 from vrc import VRC, extract_uid, explain_error
+from stats import Stats, make_tz
 
 load_dotenv()
 log = logging.getLogger("vrcbot")
@@ -53,18 +56,28 @@ class Bot(commands.Bot):
         self.last_loc, self.last_status, self.world_cache = {}, {}, {}
         self.owner_cache = {}  # id -> (取得時刻, 名前 or None)
         self.ingame = set()    # 現在VRChat(ゲーム内)にログイン中と判断しているUID
+        self.stats = Stats(self.db.c, make_tz(os.environ.get("STATS_TZ", "Asia/Tokyo")))
 
     async def setup_hook(self):
         self.tree.add_command(FriendGroup(self), guild=discord.Object(GUILD_ID))
+        self.tree.add_command(self.make_stats_command(), guild=discord.Object(GUILD_ID))
         await self.tree.sync(guild=discord.Object(GUILD_ID))
         await asyncio.to_thread(self.vrc.login)
+        asyncio.create_task(self.heartbeat())
         asyncio.create_task(self.prime_cache())
         asyncio.create_task(self.ws_loop())
 
     async def prime_cache(self):
         for f in self.db.active():
-            await self.snapshot(f["uid"])
+            u = await self.snapshot(f["uid"])
+            if u:  # 停止中に起きたログイン/ログアウトを統計履歴に反映
+                self.stats.reconcile(f["uid"], f["uid"] in self.ingame, u["status"], close_at=self.stats.prev_alive)
             await asyncio.sleep(1.5)
+
+    async def heartbeat(self):
+        while True:
+            self.stats.heartbeat()
+            await asyncio.sleep(60)
 
     def seed(self, uid, u):
         """get_userの結果から、ステータスと「ゲーム内にいるか」を復元 (state: online=ゲーム内 / active=Webのみ)"""
@@ -140,6 +153,31 @@ class Bot(commands.Bot):
             if info["thumb"]: embed.set_thumbnail(url=info["thumb"])
             if info["desc"]: embed.add_field(name="説明", value=info["desc"], inline=False)
 
+    # ---------- /stats ----------
+    def make_stats_command(self):
+        @app_commands.describe(days="直近何日分を集計するか (省略時は集計開始から全期間)")
+        async def stats(i: discord.Interaction, days: Optional[app_commands.Range[int, 1, 365]] = None):
+            if i.user.id != OWNER:
+                return await i.response.send_message("所有者のみ実行できます。", ephemeral=True)
+            now, since = time.time(), self.stats.since()
+            start = max(since, now - days * 86400) if days else since
+            if i.channel_id == MAIN_CH:  # メインチャンネル: 登録中の全フレンド
+                names = {r["uid"]: r["name"] for r in self.db.active()}
+                if not names:
+                    return await i.response.send_message("登録フレンドがいません。")
+                res = self.stats.summarize(list(names), start, now)
+                e = stats_embed("📊 ログイン統計 (登録フレンド全員)", res, start, now, self.stats.tz, names)
+            else:  # フレンド用チャンネル: そのフレンドだけ
+                row = next((r for r in self.db.all() if r["channel_id"] == i.channel_id), None)
+                if not row:
+                    return await i.response.send_message(
+                        "メインチャンネルか、フレンド用チャンネルで実行してください。", ephemeral=True)
+                res = self.stats.summarize([row["uid"]], start, now)
+                title = f"📊 {row['name']} のログイン統計" + ("" if row["active"] else " (削除済み)")
+                e = stats_embed(title, res, start, now, self.stats.tz)
+            await i.response.send_message(embed=e)
+        return app_commands.Command(name="stats", description="フレンドのログイン時間帯・ステータス使用割合の統計", callback=stats)
+
     # ---------- WebSocket ----------
     async def ws_loop(self):
         backoff = 5
@@ -174,6 +212,7 @@ class Bot(commands.Bot):
         if t == "friend-online":
             if platform == "web": return
             self.ingame.add(uid)
+            self.stats.record(uid, "login", user.get("status") or (self.last_status.get(uid) or (None,))[0])
             e = discord.Embed(title=f"🟢 {name} がオンライン", color=0x2ECC71)
             if platform: e.add_field(name="プラットフォーム", value=platform)
             loc = c.get("location") or (user.get("location"))
@@ -185,11 +224,14 @@ class Bot(commands.Bot):
             self.last_loc.pop(uid, None)
             if uid not in self.ingame: return  # Webの入退室など、ゲームに入っていない人の離脱は通知しない
             self.ingame.discard(uid)
+            self.stats.record(uid, "logout")
             await self.send_to(uid, embed=discord.Embed(title=f"⚫ {name} がオフライン", color=0x95A5A6))
         elif t == "friend-location":
             loc = c.get("location")
             if not loc or loc == "offline": return
-            self.ingame.add(uid)  # 実在の場所を持つ=ゲーム内(オンライン通知を取りこぼしていても復元)
+            if uid not in self.ingame:  # 実在の場所を持つ=ゲーム内(オンライン通知を取りこぼしていても復元)
+                self.ingame.add(uid)
+                self.stats.record(uid, "resume", (self.last_status.get(uid) or (None,))[0])
             if loc == "traveling" or loc == self.last_loc.get(uid): return
             self.last_loc[uid] = loc
             e = discord.Embed(title=f"🚪 {name} が移動", color=0x3498DB)
@@ -200,6 +242,8 @@ class Bot(commands.Bot):
             if st is None: return
             old = self.last_status.get(uid)
             self.last_status[uid] = (st, desc)
+            if uid in self.ingame and self.stats.state(uid)[1] != st:
+                self.stats.record(uid, "status", st)  # ゲーム内でのステータス変更だけ統計に使う(比較は統計履歴上の現ステータス)
             if old == (st, desc): return
             emoji, color = STATUS.get(st, ("❔", 0x95A5A6))
             e = discord.Embed(title=f"{emoji} {name} のステータス変更", color=color)
@@ -208,6 +252,45 @@ class Bot(commands.Bot):
             await self.send_to(uid, embed=e)
 
 esc = lambda s: discord.utils.escape_markdown(discord.utils.escape_mentions(s or ""))
+
+
+def stats_embed(title, res, start, end, tz, names=None):
+    """Stats.summarize() の結果をEmbedにする。names={uid: 表示名} を渡すとフレンド別も出す。"""
+    tot = res["total"]
+    fmt = lambda ts: datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M")
+    e = discord.Embed(title=title, color=0x9B59B6)
+    e.description = (f"📅 **集計期間**: {fmt(start)} 〜 {fmt(end)} ({datetime.fromtimestamp(end, tz).tzname()})"
+                     f" ・約{(end - start) / 86400:.1f}日間\n"
+                     f"🔢 **ゲーム内ログイン**: {tot['logins']}回 ・ ゲーム内滞在 {tot['seconds'] / 3600:.1f}時間")
+    h, mx = tot["hours"], max(tot["hours"])
+    if mx == 0:
+        e.add_field(name="⏰ ログイン頻度 (時間帯別)", value="まだ記録がありません", inline=False)
+    else:
+        top = " / ".join(f"{x}時台({h[x]}回)" for x in sorted(range(24), key=lambda x: (-h[x], x))[:3] if h[x])
+        bars = [f"{x:02d}時 {'█' * max(1, round(10 * c / mx)) if c else '':<10} {c}" for x, c in enumerate(h)]
+        e.add_field(name="⏰ ログイン頻度 (時間帯別)", value=f"最多: {top}\n```\n" + "\n".join(bars) + "\n```", inline=False)
+    ss, total = tot["status"], sum(tot["status"].values())
+    if total <= 0:
+        e.add_field(name="🎭 ステータス使用割合", value="まだ記録がありません", inline=False)
+    else:
+        lines = [f"{STATUS.get(k, ('❔',))[0]} {k if k != 'unknown' else '不明'} **{v / total * 100:.1f}%** ({v / 3600:.1f}時間)"
+                 for k, v in sorted(ss.items(), key=lambda kv: -kv[1])]
+        e.add_field(name="🎭 ステータス使用割合 (ゲーム内の滞在時間ベース)", value="\n".join(lines), inline=False)
+    if names:
+        per = res["per"]
+        order = sorted(names, key=lambda u: (-per[u]["logins"], (names[u] or "").lower()))
+        lines = []
+        for u in order[:10]:
+            p = per[u]
+            if p["logins"]:
+                peak = max(range(24), key=lambda x: (p["hours"][x], -x))
+                lines.append(f"**{esc(names[u])}** — {p['logins']}回 / 最多 {peak}時台 / {p['seconds'] / 3600:.1f}h")
+            else:
+                lines.append(f"**{esc(names[u])}** — " + (f"{p['seconds'] / 3600:.1f}h (ログイン記録なし)" if p["seconds"] else "記録なし"))
+        if len(order) > 10: lines.append(f"…他{len(order) - 10}人")
+        e.add_field(name="👥 フレンド別 (ログイン回数順)", value="\n".join(lines), inline=False)
+    e.set_footer(text="ゲーム内のログインのみ集計(Webのみは対象外)。集計開始後に登録したフレンドは登録後の分だけです。")
+    return e
 
 
 class ConfirmRemove(discord.ui.View):
@@ -232,6 +315,8 @@ class ConfirmRemove(discord.ui.View):
         self.bot.db.deactivate(self.uid)
         self.bot.last_loc.pop(self.uid, None)
         self.bot.last_status.pop(self.uid, None)
+        self.bot.stats.reconcile(self.uid, False, None)  # 削除時点でゲーム内区間を閉じる
+        self.bot.ingame.discard(self.uid)
         log.info("friend removed by=%s uid=%s name=%s", i.user.id, self.uid, row["name"])
         e = discord.Embed(title="➖ メンバー削除", description=f"**{esc(row['name'])}**\n`{self.uid}`", color=0xE74C3C)
         try:
@@ -351,6 +436,7 @@ class FriendGroup(app_commands.Group):
                 return await i.followup.send(f"❌ チャンネル作成に失敗しました (Botの権限を確認): {e.status}")
             self.bot.db.upsert(uid, u["name"], ch.id)
         self.bot.seed(uid, u)
+        self.bot.stats.reconcile(uid, uid in self.bot.ingame, u["status"])
         log.info("friend added by=%s uid=%s name=%s rejoin=%s", i.user.id, uid, u["name"], bool(existing))
         warn = "" if u["is_friend"] else "\n⚠️ このアカウントとフレンドではないため、通知は届きません。"
         e = discord.Embed(title="➕ メンバー追加" + ("(再登録)" if existing else ""),

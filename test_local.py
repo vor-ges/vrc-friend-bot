@@ -1,5 +1,5 @@
 """オフライン単体テスト: python test_local.py (Discord/VRChatへ接続しません)"""
-import os, sys, asyncio, tempfile, types
+import os, re, sys, time, asyncio, tempfile, types
 from vrc import extract_uid, explain_error
 
 U = "usr_12345678-1234-1234-1234-123456789abc"
@@ -114,3 +114,113 @@ async def run3():
 import json
 asyncio.run(run3())
 print("INGAME TESTS PASSED")
+
+# ================= 統計 (/stats) =================
+from datetime import datetime, timedelta, timezone
+from stats import Stats
+JST = timezone(timedelta(hours=9))
+BASE = datetime.now(JST).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=10)
+T = lambda d, h=0, m=0: (BASE + timedelta(days=d - 1, hours=h, minutes=m)).timestamp()  # BASE=10日前の0:00(JST)
+def mkstats():
+    d = DB(":memory:"); s = Stats(d.c, JST)
+    s.c.execute("UPDATE stats_meta SET v=? WHERE k='since'", (str(T(1)),)); s.c.commit()
+    return s
+
+# --- 集計ロジック ---
+s = mkstats(); R = s.record
+R("A", "login", "join me", T(1, 21)); R("A", "status", "busy", T(1, 22)); R("A", "logout", None, T(1, 23, 30))
+R("B", "login", "active", T(1, 21, 30)); R("B", "logout", None, T(1, 22)); R("B", "login", "active", T(2, 3)); R("B", "logout", None, T(2, 4))
+r = s.summarize(["A", "B"], T(1), T(3))
+a, b, tot = r["per"]["A"], r["per"]["B"], r["total"]
+assert a["status"]["join me"] == 3600 and a["status"]["busy"] == 5400 and a["logins"] == 1, dict(a["status"])
+assert b["status"]["active"] == 5400 and b["logins"] == 2
+assert tot["logins"] == 3 and tot["hours"][21] == 2 and tot["hours"][3] == 1 and sum(tot["hours"]) == 3  # 時間帯はJST
+assert tot["seconds"] == 14400
+# 期間の切り出し: 22:30以降だけ -> 21時のログインは数えず、滞在はbusyの1時間のみ
+r = s.summarize(["A"], T(1, 22, 30), T(3)); assert r["total"]["logins"] == 0 and r["total"]["status"]["busy"] == 3600 and "join me" not in r["total"]["status"]
+# resumeは頻度に数えないが滞在には数える / 継続中は終了時刻まで / 二重ログイン / ゲーム外のステータス変更は無視
+R("C", "resume", "busy", T(1, 20)); R("C", "logout", None, T(1, 21))
+R("D", "login", "ask me", T(1, 20))
+R("E", "login", "busy", T(1, 20)); R("E", "login", "active", T(1, 21)); R("E", "logout", None, T(1, 22))
+R("F", "status", "busy", T(1, 19)); R("F", "login", "active", T(1, 20)); R("F", "logout", None, T(1, 21)); R("F", "status", "busy", T(1, 22))
+r = s.summarize(list("CDEF"), T(1), T(1, 22))["per"]
+assert r["C"]["logins"] == 0 and r["C"]["status"]["busy"] == 3600
+assert r["D"]["status"]["ask me"] == 7200
+assert r["E"]["logins"] == 2 and r["E"]["status"]["busy"] == 3600 and r["E"]["status"]["active"] == 3600
+assert r["F"]["status"]["active"] == 3600 and "busy" not in r["F"]["status"]
+assert s.summarize([], T(1), T(2))["total"]["logins"] == 0
+# reconcile: 停止中のズレ補正
+s = mkstats()
+s.reconcile("G", True, "busy"); assert s.state("G")[:2] == (True, "busy")            # 履歴なし+ゲーム内 -> resume
+s.reconcile("G", True, "busy"); assert s.c.execute("SELECT COUNT(*) FROM activity").fetchone()[0] == 1  # 同状態は追記なし
+s.reconcile("G", True, "active"); assert s.state("G")[:2] == (True, "active")        # ステータス変化を反映
+s.record("H", "login", "active", T(1, 20)); s.reconcile("H", False, None, close_at=T(1, 21, 30))
+assert s.state("H")[0] is False and s.summarize(["H"], T(1), T(2))["total"]["seconds"] == 5400  # 停止直前の時刻で閉じる
+s.reconcile("I", False, None); assert s.state("I") == (False, None, None)            # 何もなければ何もしない
+
+# --- イベント -> 記録 / コマンド ---
+class FI:
+    def __init__(s, uid, ch): s.user = types.SimpleNamespace(id=uid); s.channel_id = ch; s.out = None; s.response = types.SimpleNamespace(send_message=s._send, edit_message=s._edit)
+    async def _send(s, content=None, **kw): s.out = (content, kw)
+    async def _edit(s, **kw): s.out = ("edit", kw)
+def kinds(st, uid): return [(r["kind"], r["status"]) for r in st.c.execute("SELECT kind,status FROM activity WHERE uid=? ORDER BY ts,id", (uid,))]
+async def run4():
+    bot = B.Bot(); bot.vrc = FakeVRC(); bot.db = DB(":memory:"); bot.stats = Stats(bot.db.c, JST)
+    bot.db.upsert("usr_a", "Alice", 111); bot.db.upsert("usr_b", "Bob*", 222)
+    async def fake_send(uid, **kw): pass
+    bot.send_to = fake_send
+    ev = lambda t, uid="usr_a", **c: bot.handle({"type": t, "content": {"userId": uid, **c}})
+    await ev("friend-active", platform="web"); await ev("friend-offline")                       # Webだけ -> 記録なし
+    await ev("friend-update", user={"status": "busy"})                                          # ゲーム外のステータス変更 -> 記録なし
+    assert kinds(bot.stats, "usr_a") == []
+    await ev("friend-online", platform="standalonewindows", location="private", user={"status": "join me"})
+    await ev("friend-update", user={"status": "busy"}); await ev("friend-update", user={"status": "busy", "statusDescription": "x"})  # 同ステータスは1回
+    await ev("friend-offline"); await ev("friend-offline")
+    assert kinds(bot.stats, "usr_a") == [("login", "join me"), ("status", "busy"), ("logout", None)], kinds(bot.stats, "usr_a")
+    await ev("friend-location", location="private"); assert kinds(bot.stats, "usr_a")[-1][0] == "resume"   # online取りこぼし -> resume
+    await ev("friend-online", platform="web"); assert len([k for k in kinds(bot.stats, "usr_a") if k[0] == "login"]) == 1
+    # コマンド: 現実的なデータで表示を確認
+    bot.stats.c.execute("DELETE FROM activity"); bot.stats.c.execute("UPDATE stats_meta SET v=? WHERE k='since'", (str(T(1)),)); bot.stats.c.commit()
+    for d in range(1, 9):
+        bot.stats.record("usr_a", "login", "join me", T(d, 21)); bot.stats.record("usr_a", "status", "busy", T(d, 22)); bot.stats.record("usr_a", "logout", None, T(d, 23, 30))
+    bot.stats.record("usr_b", "login", "active", T(2, 9)); bot.stats.record("usr_b", "logout", None, T(2, 10))
+    cb = bot.make_stats_command().callback
+    i = FI(1, 2); await cb(i, None); assert i.out[1].get("ephemeral") and "所有者" in i.out[0]           # 他人は拒否
+    i = FI(99, 999); await cb(i, None); assert i.out[1].get("ephemeral")                                 # 無関係チャンネルは拒否
+    i = FI(99, 2); await cb(i, None); e = i.out[1]["embed"]
+    f = {x.name: x.value for x in e.fields}
+    assert "全員" in e.title and "集計期間" in e.description and "ゲーム内ログイン" in e.description and "9回" in e.description
+    assert "21時台(8回)" in f["⏰ ログイン頻度 (時間帯別)"] and "09時台" not in f["⏰ ログイン頻度 (時間帯別)"] or "9時台(1回)" in f["⏰ ログイン頻度 (時間帯別)"]
+    st = [v for k, v in f.items() if k.startswith("🎭")][0]
+    assert "join me" in st and "busy" in st and "active" in st, st   # ステータス別の割合
+    assert abs(sum(float(x) for x in re.findall(r"\*\*([\d.]+)%\*\*", st)) - 100) < 0.2
+    fr = [v for k, v in f.items() if k.startswith("👥")][0]; assert "Alice" in fr and "最多 21時台" in fr and "Bob\\*" in fr  # 名前はエスケープ
+    i = FI(99, 111); await cb(i, 3); e = i.out[1]["embed"]                                               # フレンドチャンネル+days
+    exp = sum(1 for d in range(1, 9) if T(d, 21) >= time.time() - 3 * 86400)  # 実行時刻に依存するので期待値は計算で出す
+    assert "Alice" in e.title and not any(x.name.startswith("👥") for x in e.fields) and f"{exp}回" in e.description and "約3.0日間" in e.description, e.description
+    bot.db.deactivate("usr_b"); i = FI(99, 222); await cb(i, None); assert "削除済み" in i.out[1]["embed"].title  # 削除済みも履歴を見られる
+    # 巨大データでもDiscord上限(フィールド1024/全体6000)に収まる
+    for n in range(40):
+        bot.db.upsert(f"usr_{n:02d}", "名前" * 12, 5000 + n)
+        for h in range(24): bot.stats.record(f"usr_{n:02d}", "login", "active", T(3, h)); bot.stats.record(f"usr_{n:02d}", "logout", None, T(3, h, 30))
+    i = FI(99, 2); await cb(i, None); e = i.out[1]["embed"]
+    assert all(len(x.value) <= 1024 for x in e.fields) and len(e) <= 6000 and len(e.description) <= 4096, (len(e), [len(x.value) for x in e.fields])
+    assert "…他" in [x.value for x in e.fields if x.name.startswith("👥")][0]
+    # 削除: ゲーム内区間を閉じる / 起動時の照合
+    bot.stats.record("usr_a", "login", "active"); bot.ingame.add("usr_a")
+    view = B.ConfirmRemove(bot, bot.db.get("usr_a")); await view.yes.callback(FI(99, 2))
+    assert bot.stats.state("usr_a")[0] is False and "usr_a" not in bot.ingame
+    bot.db.upsert("usr_a", "Alice", 111); bot.stats.c.execute("DELETE FROM activity WHERE uid='usr_a'"); bot.stats.c.commit()
+    bot.stats.record("usr_a", "login", "busy", T(1, 20)); bot.stats.prev_alive = T(1, 21)
+    bot.vrc.get_user = lambda u: {"name": "x", "status": "active", "desc": "", "is_friend": True, "state": "active"}
+    for n in range(40): bot.db.deactivate(f"usr_{n:02d}")
+    bot.db.deactivate("usr_b"); await bot.prime_cache()                                                 # 停止中にゲームを抜けていた
+    assert bot.stats.state("usr_a")[0] is False and bot.stats.state("usr_a")[2] == T(1, 21)
+asyncio.run(run4())
+
+# --- スラッシュコマンド定義 ---
+from discord import app_commands
+_t = app_commands.CommandTree(discord.Client(intents=discord.Intents.default()))
+_c = B.Bot().make_stats_command(); _t.add_command(_c, guild=discord.Object(1))
+_o = _c.to_dict(_t)["options"][0]; assert _o["name"] == "days" and not _o.get("required") and _o["min_value"] == 1 and _o["max_value"] == 365
+print("STATS TESTS PASSED")
