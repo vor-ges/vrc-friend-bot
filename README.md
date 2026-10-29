@@ -58,5 +58,7 @@ nur_ieren
 Development assistance tools, including Claude Code, were used during development.  
 
 ## Licence
-This project is licensed under the MIT License. See the LICENSE file for details.
+
+This project is licensed under the MIT License. See LICENSE for details.
+
 [MIT License](https://opensource.org/license/mit)
