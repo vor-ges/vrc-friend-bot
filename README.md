@@ -1,49 +1,62 @@
-## Name
-もともと私的利用する目的だったので、なんの変哲もない  
-"vrc-friend-bot"  
-になります。  
-今後名前を変えることもあるかもしれません。
+# vrc-friend-bot
+A Discord bot for tracking and notifying you about your VRChat friends' online activity.  
 
 ## Concept
-某名鑑の流行に伴って増えたフレンドのうち、未だに出会えてないフレンドのログイン時間を分析しようとして生まれました。  
-そのフレンドが早い時間にログインしていたなら、いつもよりも早くログインするなどしたらよいかもしれません。  
+This project started with a simple question: When are my friends usually online?  
+As the popularity of vrc-meikan grew, I added more friends, many of whom I have not yet had the chance to meet.  
+I wanted to understand their usual login times.  
+If I knew that a friend tended to come online earlier than I expected, I might be able to log in earlier myself and increase the chances of meeting them.  
+That idea led to the development of this bot.  
 
 ## Overview
-フレンドの平均的なログイン時間の確認、分析に向いています。  
-24時間稼働させることができるサーバーがあるとなお良いでしょう。  
-私はOracle CloudのUbuntuサーバーを用いて24時間稼働させています。    
+vrc-friend-bot sends notifications to Discord when your VRChat friends' online statuses or other status information change.  
+It also records their login times, making it easier to understand their activity patterns.  
+For long-term tracking, running the bot on a server that can stay online 24/7 is recommended.  
+I run mine on an Ubuntu server hosted on Oracle Cloud.  
+
+## Features 
+・Mention notifications when a friend comes online  
+・Notifications when a friend goes offline  
+・Information about the worlds and instances that friends join  
+・Notifications when a friend's status changes  
+・Logging, statistics, and analysis of friends' login times  
+
+Note: Logging in to VRChat through the website is not counted when determining whether a friend is online or offline.  
+
+It is planed to add a language change feature in the future.  
 
 ## Requirement
-requirements.txtを参照してください。  
-
-## Version
-1.0.0
-
-## Features
-discordのbotを用いて、  
-・フレンドがオンラインになったらメンション通知する機能  
-・フレンドがオフラインになったら通知する機能  
-・フレンドがJoinしたワールド・インスタンスの情報を表示する機能  
-・フレンドのステータス変更を通知する機能  
-・フレンドがログインしている時間帯を統計をとり、分析する機能  
-を利用できます。
-
-なお、Webのログインはオンライン・オフライン判定の対象外としています。
+See requirements.txt for the required Python packages.  
 
 ## How to use
-1.discordのbotを用意します。  
-2..env.exampleに情報を書き込み、.example拡張子を外します。  
-3.最新版のPythonをインストールします。  
-4.requirements.txtを用いて必要なライブラリをインストールします。
-5.ファイル全てが同じパスにあることを確認した後、bot.pyを動かします。
+1. Create a Discord bot and configure the necessary permissions.  
+2. Use .env.example as a template to create your .env file and configure the required environment variables.  
+3. Install Python.  
+4. Install the required packages listed in requirements.txt.  
+5. Make sure all required files are in the same directory.  
+6. Run bot.py to start the bot.  
 
-## Reference
-Claude Code Free Plan(?  
+Detailed setup instructions and the supported Python version may be added in the future.  
+
+## Security
+The .env file contains sensitive information, such as your Discord bot token.  
+Do not share or publish this file.  
+Before publishing the project on GitHub, make sure that .env is excluded from version control.  
+Use .env.example to provide a template without exposing actual credentials.  
+
+## Version
+1.0.0  
+
+## Development
+This project was originally created for personal use.  
 
 ## Author
-私(nur_ieren)だと思います。  
-[xのアカウント](https://x.com/nur_ieren)  
+nur_ieren  
+[X](https://x.com/nur_ieren)  
+
+## Acknowledgements
+Development assistance tools, including Claude Code, were used during development.  
 
 ## Licence
-This project is licensed under the MIT License, see the LICENSE.txt file for details.
-[MIT](https://opensource.org/license/mit)
+This project is licensed under the MIT License. See the LICENSE file for details.
+[MIT License](https://opensource.org/license/mit)
