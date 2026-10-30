@@ -4,13 +4,13 @@ A Discord bot for tracking and notifying you about your VRChat friends' online a
 
 ## Concept
 
-This project started with a simple question: When are my friends usually online?
+This project started with a simple question of my friend: When are my friends usually online?
 
-As the popularity of [vrc-meikan](https://vrc-meikan.com/) grew, I added more friends, many of whom I have not yet had the chance to meet.
+As the popularity of [vrc-meikan](https://vrc-meikan.com/) grew, he added more friends, many of whom he has not yet had the chance to meet.
 
-I wanted to understand their usual login times.
+He wanted to understand their usual login times.
 
-If I knew that a friend tended to come online earlier than I expected, I might be able to log in earlier myself and increase the chances of meeting them.
+If he knew that a friend tended to come online earlier than he expected, he might be able to log in earlier himself and increase the chances of meeting them.
 
 That idea led to the development of this bot.
 
@@ -22,7 +22,7 @@ It also records their login times, making it easier to understand their activity
 
 For long-term tracking, running the bot on a server that can stay online 24/7 is recommended.
 
-I run mine on an Ubuntu server hosted on Oracle Cloud.
+He run mine on an Ubuntu server hosted on Oracle Cloud, for example.
 
 ## Features
 
