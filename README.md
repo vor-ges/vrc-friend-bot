@@ -75,7 +75,8 @@ This project was originally created for personal use.
 
 ## Author
 
-vor_ges
+- vor_ges
+- nur_ieren
 
 ## Acknowledgements
 
