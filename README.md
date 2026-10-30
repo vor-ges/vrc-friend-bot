@@ -75,9 +75,7 @@ This project was originally created for personal use.
 
 ## Author
 
-nur_ieren
-
-[X](https://x.com/nur_ieren)
+vor_ges
 
 ## Acknowledgements
 
