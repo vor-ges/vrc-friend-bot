@@ -82,8 +82,15 @@ This project was originally created for personal use.
 
 Development assistance tools, including Claude Code, were used during development.
 
-## Licence
+## Copyright
 
-This project is licensed under the MIT License. See LICENSE for details.
+Copyright © 2026 vor_ges and nur_ieren.
 
-[MIT License](https://opensource.org/license/mit)
+All rights reserved.
+
+No part of this project, including its source code,
+design, text, images, or other content, may be
+reproduced, modified, distributed, or used without
+prior written permission from the copyright holder.
+
+This project is not licensed for reuse.
