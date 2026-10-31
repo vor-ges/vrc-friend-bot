@@ -257,9 +257,9 @@ except ValueError: pass
 assert i18n.get_lang() == "en"
 i18n.set_lang("ja")
 for c, want in [("en", "en"), ("EN", "en"), (" eng ", "en"), ("en-US", "en"), ("en_GB", "en"), ("ja", "ja"), ("jpn", "ja"),
-                ("jp", "ja"), ("JP", "ja"), ("ja-JP", "ja")]:
-    assert i18n.resolve(c) == want, c                                     # ISO 639-1/2 + 別名jp、大小文字・地域つき表記
-for c in ["", " ", "e", "fr", "jpx", "english", "日本語", None, "-", "xx-en"]:
+                ("JA", "ja"), ("ja-JP", "ja")]:
+    assert i18n.resolve(c) == want, c                                     # ISO 639-1/2、大小文字・地域つき表記
+for c in ["", " ", "e", "fr", "jp", "JP", "jpx", "english", "日本語", None, "-", "xx-en"]:   # jp はISO 639ではないので不可
     assert i18n.resolve(c) is None, c
 _d = DB(":memory:"); assert i18n.load(_d.c) == "ja"                  # 設定が無い(旧DB)ならja
 i18n.save(_d.c, "en"); i18n.set_lang("ja"); assert i18n.load(_d.c) == "en"   # 再起動後も保持
@@ -304,7 +304,8 @@ async def run5():
     # ボタン名・一覧も英語 / jaに戻すと日本語に戻る
     v = B.ConfirmRemove(bot, bot.db.get("usr_a")); assert (v.yes.label, v.no.label) == ("Remove", "Cancel")
     assert "registered friends" in B.ListView(bot.db.active(), False).embed().title
-    i = FI(99, 2); await lang(i, "jp"); assert i18n.get_lang() == "ja" and "切り替えました" in i.out[0]    # jp(別名)で日本語へ
+    i = FI(99, 2); await lang(i, "jp"); assert i.out[1].get("ephemeral") and i18n.get_lang() == "en"   # jpは未対応(ISO 639ではない)
+    i = FI(99, 2); await lang(i, "jpn"); assert i18n.get_lang() == "ja" and "切り替えました" in i.out[0]   # 3文字コードで日本語へ
     assert bot.db.c.execute("SELECT v FROM bot_settings WHERE k='lang'").fetchone()[0] == "ja"          # 保存されるのは正規コード
     v = B.ConfirmRemove(bot, bot.db.get("usr_a")); assert (v.yes.label, v.no.label) == ("削除する", "キャンセル")
     await ev("friend-online", platform="android", location="private"); assert sent[-1].title == "🟢 Alice がオンライン"
