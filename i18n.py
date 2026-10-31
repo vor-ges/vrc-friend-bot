@@ -11,7 +11,16 @@ import logging
 log = logging.getLogger("vrcbot")
 
 LANGS = {"ja": "日本語", "en": "English"}
+# /lang に入力できるコード: ISO 639-1(2文字) と ISO 639-2/3(3文字)。
+# 言語を足すときは LANGS と TABLES に加え、ここにもコードを書く。
+CODES = {"ja": "ja", "jpn": "ja", "en": "en", "eng": "en"}
 _lang = "ja"
+
+
+def resolve(text):
+    """ユーザー入力(en / ja / jpn / jp / en-US など)を LANGS のコードに変換。不明なら None。"""
+    s = (text or "").strip().lower().replace("_", "-").split("-")[0]  # en-US, ja_JP -> en / ja
+    return CODES.get(s)
 
 TABLES = {
     "en": {
@@ -89,9 +98,8 @@ TABLES = {
         "**{name}**\n`{uid}`\nチャンネル: <#{ch}> (削除されません)": "**{name}**\n`{uid}`\nChannel: <#{ch}> (will not be deleted)",
         "登録なし": "No registrations",
         # --- /lang ---
-        "現在の言語: {name} ({code})": "Current language: {name} ({code})",
         "言語を {name} に切り替えました。": "Language switched to {name}.",
-        "未対応の言語です。": "Unsupported language.",
+        "未対応の言語です。使用できるコード: {codes}": "Unsupported language. Available codes: {codes}",
         # --- VRChat APIのエラー (vrc.explain_error) ---
         "VRChat APIの応答がタイムアウトしました。少し待って再試行してください。": "The VRChat API timed out. Please wait a moment and try again.",
         "VRChatの再認証(2FA)が必要です。サーバーで `python bot.py` を手動起動して認証してください。":
