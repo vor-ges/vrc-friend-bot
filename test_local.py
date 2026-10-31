@@ -256,6 +256,11 @@ try: i18n.set_lang("xx"); raise SystemExit("unsupported lang accepted")
 except ValueError: pass
 assert i18n.get_lang() == "en"
 i18n.set_lang("ja")
+for c, want in [("en", "en"), ("EN", "en"), (" eng ", "en"), ("en-US", "en"), ("en_GB", "en"), ("ja", "ja"), ("jpn", "ja"),
+                ("jp", "ja"), ("JP", "ja"), ("ja-JP", "ja")]:
+    assert i18n.resolve(c) == want, c                                     # ISO 639-1/2 + 別名jp、大小文字・地域つき表記
+for c in ["", " ", "e", "fr", "jpx", "english", "日本語", None, "-", "xx-en"]:
+    assert i18n.resolve(c) is None, c
 _d = DB(":memory:"); assert i18n.load(_d.c) == "ja"                  # 設定が無い(旧DB)ならja
 i18n.save(_d.c, "en"); i18n.set_lang("ja"); assert i18n.load(_d.c) == "en"   # 再起動後も保持
 i18n.save(_d.c, "zz"); assert i18n.load(_d.c) == "ja"                # 壊れた値はjaに戻す
@@ -271,11 +276,12 @@ async def run5():
     bot.send_to = fake_send
     lang = bot.make_lang_command().callback
     i = FI(1, 2); await lang(i, "en"); assert i.out[1].get("ephemeral") and i18n.get_lang() == "ja"   # 他人は変更不可
-    i = FI(99, 2); await lang(i, None); assert "日本語" in i.out[0] and "ja" in i.out[0]                 # 引数なしは現在の言語
+    i = FI(1, 2); await lang(i, "fr"); assert i.out[1].get("ephemeral") and "所有者" in i.out[0]         # 他人には対応コードも教えない
     i = FI(99, 2); await lang(i, "en"); assert i.out[0] == "Language switched to English." and i18n.get_lang() == "en"
     assert bot.db.c.execute("SELECT v FROM bot_settings WHERE k='lang'").fetchone()[0] == "en"          # DBに保存
-    i = FI(99, 2); await lang(i, None); assert "English" in i.out[0] and i.out[0].startswith("Current language")
-    i = FI(99, 2); await lang(i, "fr"); assert i.out[1].get("ephemeral") and i.out[0] == "Unsupported language."
+    i = FI(99, 2); await lang(i, "fr"); assert i.out[1].get("ephemeral") and i.out[0] == "Unsupported language. Available codes: ja, en"
+    assert i18n.get_lang() == "en"                                                                     # 失敗しても言語は変わらない
+    i = FI(99, 2); await lang(i, "EN-us"); assert i.out[0] == "Language switched to English."          # 大小文字・地域つきでも可
     # 通知(オンライン/移動/ステータス/オフライン)が英語になる
     ev = lambda t, **c: bot.handle({"type": t, "content": {"userId": "usr_a", **c}})
     P = f"{W}:1~group(grp_y)~groupAccessType(plus)~region(jp)"
@@ -298,7 +304,8 @@ async def run5():
     # ボタン名・一覧も英語 / jaに戻すと日本語に戻る
     v = B.ConfirmRemove(bot, bot.db.get("usr_a")); assert (v.yes.label, v.no.label) == ("Remove", "Cancel")
     assert "registered friends" in B.ListView(bot.db.active(), False).embed().title
-    i = FI(99, 2); await lang(i, "ja"); assert i18n.get_lang() == "ja" and "切り替えました" in i.out[0]
+    i = FI(99, 2); await lang(i, "jp"); assert i18n.get_lang() == "ja" and "切り替えました" in i.out[0]    # jp(別名)で日本語へ
+    assert bot.db.c.execute("SELECT v FROM bot_settings WHERE k='lang'").fetchone()[0] == "ja"          # 保存されるのは正規コード
     v = B.ConfirmRemove(bot, bot.db.get("usr_a")); assert (v.yes.label, v.no.label) == ("削除する", "キャンセル")
     await ev("friend-online", platform="android", location="private"); assert sent[-1].title == "🟢 Alice がオンライン"
 asyncio.run(run5())
@@ -308,5 +315,6 @@ assert i18n.get_lang() == "ja"
 _t2 = app_commands.CommandTree(discord.Client(intents=discord.Intents.default()))
 _c2 = B.Bot().make_lang_command(); _t2.add_command(_c2, guild=discord.Object(1))
 _d2 = _c2.to_dict(_t2); _o2 = _d2["options"][0]
-assert _d2["name"] == "lang" and _o2["name"] == "language" and not _o2.get("required") and [c["value"] for c in _o2["choices"]] == ["ja", "en"]
+assert _d2["name"] == "lang" and len(_d2["options"]) == 1
+assert _o2["name"] == "code" and _o2["type"] == 3 and _o2.get("required") is True and not _o2.get("choices") and _o2["min_length"] == 2
 print("LANG TESTS PASSED")

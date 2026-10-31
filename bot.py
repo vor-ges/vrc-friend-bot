@@ -184,20 +184,19 @@ class Bot(commands.Bot):
 
     # ---------- /lang ----------
     def make_lang_command(self):
-        @app_commands.describe(language="切り替える言語 / Language (省略すると現在の言語を表示)")
-        @app_commands.choices(language=[app_commands.Choice(name=n, value=c) for c, n in LANGS.items()])
-        async def lang(i: discord.Interaction, language: Optional[str] = None):
+        @app_commands.describe(code="言語コード (ISO 639) / Language code: en, ja")
+        async def lang(i: discord.Interaction, code: app_commands.Range[str, 2, 16]):
             if i.user.id != OWNER:
                 return await i.response.send_message(tr("所有者のみ実行できます。"), ephemeral=True)
+            language = i18n.resolve(code)
             if language is None:
-                return await i.response.send_message(tr("現在の言語: {name} ({code})", name=LANGS[i18n.get_lang()], code=i18n.get_lang()))
-            if language not in LANGS:
-                return await i.response.send_message(tr("未対応の言語です。"), ephemeral=True)
+                return await i.response.send_message(
+                    tr("未対応の言語です。使用できるコード: {codes}", codes=", ".join(LANGS)), ephemeral=True)
             i18n.set_lang(language)
             i18n.save(self.db.c, language)  # 再起動後も保持
             log.info("language switched by=%s lang=%s", i.user.id, language)
             await i.response.send_message(tr("言語を {name} に切り替えました。", name=LANGS[language]))
-        return app_commands.Command(name="lang", description="表示言語の切り替え / Switch language", callback=lang)
+        return app_commands.Command(name="lang", description="表示言語の切り替え / Switch language: /lang en, /lang ja", callback=lang)
 
     # ---------- WebSocket ----------
     async def ws_loop(self):
