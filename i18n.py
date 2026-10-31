@@ -11,14 +11,13 @@ import logging
 log = logging.getLogger("vrcbot")
 
 LANGS = {"ja": "日本語", "en": "English"}
-# /lang に入力できるコード: ISO 639-1(2文字) と ISO 639-2/3(3文字)。"jp" はISO 639ではないが入力しがちなので別名として許可。
-# 言語を足すときは LANGS と TABLES に加え、ここにもコードを書く。
-CODES = {"ja": "ja", "jpn": "ja", "jp": "ja", "en": "en", "eng": "en"}
+# /lang に入力できるコード: ISO 639-1(2文字) と ISO 639-2/3(3文字)。
+CODES = {"ja": "ja", "jpn": "ja", "en": "en", "eng": "en"}
 _lang = "ja"
 
 
 def resolve(text):
-    """ユーザー入力(en / ja / jpn / jp / en-US など)を LANGS のコードに変換。不明なら None。"""
+    """ユーザー入力(en / ja / jpn / en-US など)を LANGS のコードに変換。不明なら None。"""
     s = (text or "").strip().lower().replace("_", "-").split("-")[0]  # en-US, ja_JP -> en / ja
     return CODES.get(s)
 
