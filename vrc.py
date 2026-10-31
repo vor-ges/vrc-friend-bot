@@ -1,6 +1,5 @@
 import os, re, asyncio, vrchatapi
 from urllib.parse import urlparse
-from i18n import tr
 from vrchatapi.api import authentication_api, users_api, worlds_api, instances_api, groups_api
 from vrchatapi.exceptions import UnauthorizedException
 from vrchatapi.models.two_factor_auth_code import TwoFactorAuthCode
@@ -34,19 +33,19 @@ def extract_uid(text):
 def explain_error(e):
     """例外 -> ユーザー向けメッセージ(内部情報や秘密は含めない)"""
     if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
-        return tr("VRChat APIの応答がタイムアウトしました。少し待って再試行してください。")
+        return "VRChat APIの応答がタイムアウトしました。少し待って再試行してください。"
     if isinstance(e, EOFError):
-        return tr("VRChatの再認証(2FA)が必要です。サーバーで `python bot.py` を手動起動して認証してください。")
+        return "VRChatの再認証(2FA)が必要です。サーバーで `python bot.py` を手動起動して認証してください。"
     st = getattr(e, "status", None)
     if st == 404:
-        return tr("そのユーザーはVRChat上に存在しません。URLを確認してください。")
+        return "そのユーザーはVRChat上に存在しません。URLを確認してください。"
     if st in (401, 403):
-        return tr("VRChat認証エラーです。サーバー側で再認証が必要な可能性があります。")
+        return "VRChat認証エラーです。サーバー側で再認証が必要な可能性があります。"
     if st == 429:
-        return tr("VRChat APIのレート制限中です。しばらく待って再試行してください。")
+        return "VRChat APIのレート制限中です。しばらく待って再試行してください。"
     if isinstance(st, int) and st >= 500:
-        return tr("VRChat側のサーバーエラーです (HTTP {st})。", st=st)
-    return tr("VRChat APIでエラーが発生しました。ログを確認してください。")
+        return f"VRChat側のサーバーエラーです (HTTP {st})。"
+    return "VRChat APIでエラーが発生しました。ログを確認してください。"
 
 class VRC:
     """vrchatapi の同期呼び出しをまとめたラッパー（Bot側からは to_thread で呼ぶ）"""
