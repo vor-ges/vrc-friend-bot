@@ -1,4 +1,3 @@
-
 # vrc-friend-bot
 
 A Discord bot for tracking and notifying you about your VRChat friends' online activity.
