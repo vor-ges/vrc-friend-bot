@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 from db import DB
 from vrc import VRC, extract_uid, explain_error
 from stats import Stats, make_tz
+import i18n
+from i18n import tr, LANGS
 
 load_dotenv()
 log = logging.getLogger("vrcbot")
@@ -57,10 +59,12 @@ class Bot(commands.Bot):
         self.owner_cache = {}  # id -> (取得時刻, 名前 or None)
         self.ingame = set()    # 現在VRChat(ゲーム内)にログイン中と判断しているUID
         self.stats = Stats(self.db.c, make_tz(os.environ.get("STATS_TZ", "Asia/Tokyo")))
+        i18n.load(self.db.c)  # 保存済みの表示言語を読み込む
 
     async def setup_hook(self):
         self.tree.add_command(FriendGroup(self), guild=discord.Object(GUILD_ID))
         self.tree.add_command(self.make_stats_command(), guild=discord.Object(GUILD_ID))
+        self.tree.add_command(self.make_lang_command(), guild=discord.Object(GUILD_ID))
         await self.tree.sync(guild=discord.Object(GUILD_ID))
         await asyncio.to_thread(self.vrc.login)
         asyncio.create_task(self.heartbeat())
@@ -113,7 +117,7 @@ class Bot(commands.Bot):
         """インスタンスオーナー名。ユーザー=表示名 / グループ=グループ名。1時間キャッシュ(失敗時は5分)。"""
         c = self.owner_cache.get(oid)
         if c and time.time() - c[0] < (3600 if c[1] else 300):
-            return c[1] or "取得不可"
+            return c[1] or tr("取得不可")
         name = None
         row = kind == "usr" and self.db.get(oid)
         if row: name = row["name"]  # 登録済みフレンドならAPI不要
@@ -124,12 +128,12 @@ class Bot(commands.Bot):
             except Exception as e:
                 log.warning("owner lookup failed %s: %s", oid, e)
         self.owner_cache[oid] = (time.time(), name)
-        return name or "取得不可"
+        return name or tr("取得不可")
 
     async def world_embed_fields(self, loc, embed):
         p = parse_location(loc)
         if not p:
-            embed.add_field(name="場所", value="Private / 取得不可" if loc in ("private", None, "") else loc)
+            embed.add_field(name=tr("場所"), value=tr("Private / 取得不可") if loc in ("private", None, "") else loc)
             return
         wid, iid, label, region, owner = p
         w = self.world_cache.get(wid)
@@ -138,45 +142,62 @@ class Bot(commands.Bot):
             except Exception: w = (time.time(), None)
             self.world_cache[wid] = w
         info = w[1]
-        embed.add_field(name="ワールド", value=f"[{info['name']}](https://vrchat.com/home/world/{wid})" if info else wid, inline=False)
-        embed.add_field(name="インスタンス", value=f"{label} ({region.upper()})")
+        embed.add_field(name=tr("ワールド"), value=f"[{info['name']}](https://vrchat.com/home/world/{wid})" if info else wid, inline=False)
+        embed.add_field(name=tr("インスタンス"), value=f"{label} ({region.upper()})")
         try:
             i = await asyncio.to_thread(self.vrc.get_instance, wid, iid)
             cap = i["capacity"] or (info and info["capacity"]) or "?"
-            embed.add_field(name="人数", value=f"{i['n_users']}/{cap}")
+            embed.add_field(name=tr("人数"), value=f"{i['n_users']}/{cap}")
         except Exception:
-            embed.add_field(name="人数", value="取得不可")
+            embed.add_field(name=tr("人数"), value=tr("取得不可"))
         if owner:
             name = await self.owner_name(*owner)
-            embed.add_field(name="オーナー", value=f"{name} (グループ)" if owner[0] == "grp" else name)
+            embed.add_field(name=tr("オーナー"), value=tr("{name} (グループ)", name=name) if owner[0] == "grp" else name)
         if info:
             if info["thumb"]: embed.set_thumbnail(url=info["thumb"])
-            if info["desc"]: embed.add_field(name="説明", value=info["desc"], inline=False)
+            if info["desc"]: embed.add_field(name=tr("説明"), value=info["desc"], inline=False)
 
     # ---------- /stats ----------
     def make_stats_command(self):
         @app_commands.describe(days="直近何日分を集計するか (省略時は集計開始から全期間)")
         async def stats(i: discord.Interaction, days: Optional[app_commands.Range[int, 1, 365]] = None):
             if i.user.id != OWNER:
-                return await i.response.send_message("所有者のみ実行できます。", ephemeral=True)
+                return await i.response.send_message(tr("所有者のみ実行できます。"), ephemeral=True)
             now, since = time.time(), self.stats.since()
             start = max(since, now - days * 86400) if days else since
             if i.channel_id == MAIN_CH:  # メインチャンネル: 登録中の全フレンド
                 names = {r["uid"]: r["name"] for r in self.db.active()}
                 if not names:
-                    return await i.response.send_message("登録フレンドがいません。")
+                    return await i.response.send_message(tr("登録フレンドがいません。"))
                 res = self.stats.summarize(list(names), start, now)
-                e = stats_embed("📊 ログイン統計 (登録フレンド全員)", res, start, now, self.stats.tz, names)
+                e = stats_embed(tr("📊 ログイン統計 (登録フレンド全員)"), res, start, now, self.stats.tz, names)
             else:  # フレンド用チャンネル: そのフレンドだけ
                 row = next((r for r in self.db.all() if r["channel_id"] == i.channel_id), None)
                 if not row:
                     return await i.response.send_message(
-                        "メインチャンネルか、フレンド用チャンネルで実行してください。", ephemeral=True)
+                        tr("メインチャンネルか、フレンド用チャンネルで実行してください。"), ephemeral=True)
                 res = self.stats.summarize([row["uid"]], start, now)
-                title = f"📊 {row['name']} のログイン統計" + ("" if row["active"] else " (削除済み)")
+                title = tr("📊 {name} のログイン統計", name=row["name"]) + ("" if row["active"] else tr(" (削除済み)"))
                 e = stats_embed(title, res, start, now, self.stats.tz)
             await i.response.send_message(embed=e)
         return app_commands.Command(name="stats", description="フレンドのログイン時間帯・ステータス使用割合の統計", callback=stats)
+
+    # ---------- /lang ----------
+    def make_lang_command(self):
+        @app_commands.describe(language="切り替える言語 / Language (省略すると現在の言語を表示)")
+        @app_commands.choices(language=[app_commands.Choice(name=n, value=c) for c, n in LANGS.items()])
+        async def lang(i: discord.Interaction, language: Optional[str] = None):
+            if i.user.id != OWNER:
+                return await i.response.send_message(tr("所有者のみ実行できます。"), ephemeral=True)
+            if language is None:
+                return await i.response.send_message(tr("現在の言語: {name} ({code})", name=LANGS[i18n.get_lang()], code=i18n.get_lang()))
+            if language not in LANGS:
+                return await i.response.send_message(tr("未対応の言語です。"), ephemeral=True)
+            i18n.set_lang(language)
+            i18n.save(self.db.c, language)  # 再起動後も保持
+            log.info("language switched by=%s lang=%s", i.user.id, language)
+            await i.response.send_message(tr("言語を {name} に切り替えました。", name=LANGS[language]))
+        return app_commands.Command(name="lang", description="表示言語の切り替え / Switch language", callback=lang)
 
     # ---------- WebSocket ----------
     async def ws_loop(self):
@@ -213,8 +234,8 @@ class Bot(commands.Bot):
             if platform == "web": return
             self.ingame.add(uid)
             self.stats.record(uid, "login", user.get("status") or (self.last_status.get(uid) or (None,))[0])
-            e = discord.Embed(title=f"🟢 {name} がオンライン", color=0x2ECC71)
-            if platform: e.add_field(name="プラットフォーム", value=platform)
+            e = discord.Embed(title=tr("🟢 {name} がオンライン", name=name), color=0x2ECC71)
+            if platform: e.add_field(name=tr("プラットフォーム"), value=platform)
             loc = c.get("location") or (user.get("location"))
             self.last_loc[uid] = loc
             await self.world_embed_fields(loc, e)
@@ -225,7 +246,7 @@ class Bot(commands.Bot):
             if uid not in self.ingame: return  # Webの入退室など、ゲームに入っていない人の離脱は通知しない
             self.ingame.discard(uid)
             self.stats.record(uid, "logout")
-            await self.send_to(uid, embed=discord.Embed(title=f"⚫ {name} がオフライン", color=0x95A5A6))
+            await self.send_to(uid, embed=discord.Embed(title=tr("⚫ {name} がオフライン", name=name), color=0x95A5A6))
         elif t == "friend-location":
             loc = c.get("location")
             if not loc or loc == "offline": return
@@ -234,7 +255,7 @@ class Bot(commands.Bot):
                 self.stats.record(uid, "resume", (self.last_status.get(uid) or (None,))[0])
             if loc == "traveling" or loc == self.last_loc.get(uid): return
             self.last_loc[uid] = loc
-            e = discord.Embed(title=f"🚪 {name} が移動", color=0x3498DB)
+            e = discord.Embed(title=tr("🚪 {name} が移動", name=name), color=0x3498DB)
             await self.world_embed_fields(loc, e)
             await self.send_to(uid, embed=e)
         elif t == "friend-update":
@@ -246,9 +267,9 @@ class Bot(commands.Bot):
                 self.stats.record(uid, "status", st)  # ゲーム内でのステータス変更だけ統計に使う(比較は統計履歴上の現ステータス)
             if old == (st, desc): return
             emoji, color = STATUS.get(st, ("❔", 0x95A5A6))
-            e = discord.Embed(title=f"{emoji} {name} のステータス変更", color=color)
-            if old: e.add_field(name="変更前", value=f"{old[0]}\n{old[1] or '-'}")
-            e.add_field(name="変更後", value=f"{st}\n{desc or '-'}")
+            e = discord.Embed(title=tr("{emoji} {name} のステータス変更", emoji=emoji, name=name), color=color)
+            if old: e.add_field(name=tr("変更前"), value=f"{old[0]}\n{old[1] or '-'}")
+            e.add_field(name=tr("変更後"), value=f"{st}\n{desc or '-'}")
             await self.send_to(uid, embed=e)
 
 esc = lambda s: discord.utils.escape_markdown(discord.utils.escape_mentions(s or ""))
@@ -259,37 +280,41 @@ def stats_embed(title, res, start, end, tz, names=None):
     tot = res["total"]
     fmt = lambda ts: datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M")
     e = discord.Embed(title=title, color=0x9B59B6)
-    e.description = (f"📅 **集計期間**: {fmt(start)} 〜 {fmt(end)} ({datetime.fromtimestamp(end, tz).tzname()})"
-                     f" ・約{(end - start) / 86400:.1f}日間\n"
-                     f"🔢 **ゲーム内ログイン**: {tot['logins']}回 ・ ゲーム内滞在 {tot['seconds'] / 3600:.1f}時間")
+    e.description = tr("📅 **集計期間**: {start} 〜 {end} ({tz}) ・約{days:.1f}日間\n🔢 **ゲーム内ログイン**: {logins}回 ・ ゲーム内滞在 {hours:.1f}時間",
+                       start=fmt(start), end=fmt(end), tz=datetime.fromtimestamp(end, tz).tzname(),
+                       days=(end - start) / 86400, logins=tot["logins"], hours=tot["seconds"] / 3600)
     h, mx = tot["hours"], max(tot["hours"])
     if mx == 0:
-        e.add_field(name="⏰ ログイン頻度 (時間帯別)", value="まだ記録がありません", inline=False)
+        e.add_field(name=tr("⏰ ログイン頻度 (時間帯別)"), value=tr("まだ記録がありません"), inline=False)
     else:
-        top = " / ".join(f"{x}時台({h[x]}回)" for x in sorted(range(24), key=lambda x: (-h[x], x))[:3] if h[x])
-        bars = [f"{x:02d}時 {'█' * max(1, round(10 * c / mx)) if c else '':<10} {c}" for x, c in enumerate(h)]
-        e.add_field(name="⏰ ログイン頻度 (時間帯別)", value=f"最多: {top}\n```\n" + "\n".join(bars) + "\n```", inline=False)
+        top = " / ".join(tr("{h}時台({c}回)", h=x, c=h[x]) for x in sorted(range(24), key=lambda x: (-h[x], x))[:3] if h[x])
+        bars = [f"{tr('{h:02d}時', h=x)} {'█' * max(1, round(10 * c / mx)) if c else '':<10} {c}" for x, c in enumerate(h)]
+        e.add_field(name=tr("⏰ ログイン頻度 (時間帯別)"), value=tr("最多: {top}", top=top) + "\n```\n" + "\n".join(bars) + "\n```", inline=False)
     ss, total = tot["status"], sum(tot["status"].values())
     if total <= 0:
-        e.add_field(name="🎭 ステータス使用割合", value="まだ記録がありません", inline=False)
+        e.add_field(name=tr("🎭 ステータス使用割合"), value=tr("まだ記録がありません"), inline=False)
     else:
-        lines = [f"{STATUS.get(k, ('❔',))[0]} {k if k != 'unknown' else '不明'} **{v / total * 100:.1f}%** ({v / 3600:.1f}時間)"
+        lines = [tr("{emoji} {k} **{pct:.1f}%** ({hours:.1f}時間)", emoji=STATUS.get(k, ('❔',))[0],
+                    k=k if k != 'unknown' else tr("不明"), pct=v / total * 100, hours=v / 3600)
                  for k, v in sorted(ss.items(), key=lambda kv: -kv[1])]
-        e.add_field(name="🎭 ステータス使用割合 (ゲーム内の滞在時間ベース)", value="\n".join(lines), inline=False)
+        e.add_field(name=tr("🎭 ステータス使用割合 (ゲーム内の滞在時間ベース)"), value="\n".join(lines), inline=False)
     if names:
         per = res["per"]
         order = sorted(names, key=lambda u: (-per[u]["logins"], (names[u] or "").lower()))
         lines = []
         for u in order[:10]:
-            p = per[u]
+            p, nm = per[u], esc(names[u])
             if p["logins"]:
                 peak = max(range(24), key=lambda x: (p["hours"][x], -x))
-                lines.append(f"**{esc(names[u])}** — {p['logins']}回 / 最多 {peak}時台 / {p['seconds'] / 3600:.1f}h")
+                lines.append(tr("**{name}** — {logins}回 / 最多 {peak}時台 / {hours:.1f}h",
+                                name=nm, logins=p["logins"], peak=peak, hours=p["seconds"] / 3600))
+            elif p["seconds"]:
+                lines.append(tr("**{name}** — {hours:.1f}h (ログイン記録なし)", name=nm, hours=p["seconds"] / 3600))
             else:
-                lines.append(f"**{esc(names[u])}** — " + (f"{p['seconds'] / 3600:.1f}h (ログイン記録なし)" if p["seconds"] else "記録なし"))
-        if len(order) > 10: lines.append(f"…他{len(order) - 10}人")
-        e.add_field(name="👥 フレンド別 (ログイン回数順)", value="\n".join(lines), inline=False)
-    e.set_footer(text="ゲーム内のログインのみ集計(Webのみは対象外)。集計開始後に登録したフレンドは登録後の分だけです。")
+                lines.append(tr("**{name}** — 記録なし", name=nm))
+        if len(order) > 10: lines.append(tr("…他{n}人", n=len(order) - 10))
+        e.add_field(name=tr("👥 フレンド別 (ログイン回数順)"), value="\n".join(lines), inline=False)
+    e.set_footer(text=tr("ゲーム内のログインのみ集計(Webのみは対象外)。集計開始後に登録したフレンドは登録後の分だけです。"))
     return e
 
 
@@ -297,12 +322,13 @@ class ConfirmRemove(discord.ui.View):
     """削除前の確認 (所有者のみ操作可・60秒でタイムアウト)"""
     def __init__(self, bot, row):
         super().__init__(timeout=60)
+        self.yes.label, self.no.label = tr("削除する"), tr("キャンセル")  # ボタン名は生成時の言語で
         self.bot, self.uid, self.name = bot, row["uid"], row["name"]
         self.message = None
 
     async def interaction_check(self, i):
         if i.user.id != OWNER:
-            await i.response.send_message("所有者のみ操作できます。", ephemeral=True)
+            await i.response.send_message(tr("所有者のみ操作できます。"), ephemeral=True)
             return False
         return True
 
@@ -310,7 +336,7 @@ class ConfirmRemove(discord.ui.View):
     async def yes(self, i: discord.Interaction, b: discord.ui.Button):
         row = self.bot.db.get(self.uid)
         if not row or not row["active"]:
-            await i.response.edit_message(content="すでに削除されています。", embed=None, view=None)
+            await i.response.edit_message(content=tr("すでに削除されています。"), embed=None, view=None)
             return self.stop()
         self.bot.db.deactivate(self.uid)
         self.bot.last_loc.pop(self.uid, None)
@@ -318,24 +344,24 @@ class ConfirmRemove(discord.ui.View):
         self.bot.stats.reconcile(self.uid, False, None)  # 削除時点でゲーム内区間を閉じる
         self.bot.ingame.discard(self.uid)
         log.info("friend removed by=%s uid=%s name=%s", i.user.id, self.uid, row["name"])
-        e = discord.Embed(title="➖ メンバー削除", description=f"**{esc(row['name'])}**\n`{self.uid}`", color=0xE74C3C)
+        e = discord.Embed(title=tr("➖ メンバー削除"), description=f"**{esc(row['name'])}**\n`{self.uid}`", color=0xE74C3C)
         try:
             await self.bot.send_to(self.uid, embed=e)  # メンバーチャンネルにも履歴を残す
         except discord.HTTPException:
             log.exception("failed to write removal log to member channel uid=%s", self.uid)
         await i.response.edit_message(
-            content=f"🗑️ **{esc(row['name'])}** を削除しました (チャンネルは保持): <#{row['channel_id']}>",
+            content=tr("🗑️ **{name}** を削除しました (チャンネルは保持): <#{ch}>", name=esc(row["name"]), ch=row["channel_id"]),
             embed=e, view=None)
         self.stop()
 
     @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
     async def no(self, i: discord.Interaction, b: discord.ui.Button):
-        await i.response.edit_message(content=f"キャンセルしました: {esc(self.name)}", embed=None, view=None)
+        await i.response.edit_message(content=tr("キャンセルしました: {name}", name=esc(self.name)), embed=None, view=None)
         self.stop()
 
     async def on_timeout(self):
         if self.message:
-            try: await self.message.edit(content="確認がタイムアウトしました。削除していません。", embed=None, view=None)
+            try: await self.message.edit(content=tr("確認がタイムアウトしました。削除していません。"), embed=None, view=None)
             except discord.HTTPException: pass
 
 
@@ -356,18 +382,18 @@ class ListView(discord.ui.View):
         chunk = self.rows[self.page * self.PER:(self.page + 1) * self.PER]
         lines = []
         for r in chunk:
-            mark = "✅" if r["active"] else "🚫(削除済み)"
+            mark = "✅" if r["active"] else tr("🚫(削除済み)")
             line = f"{mark} **{esc(r['name'])}** <#{r['channel_id']}>"
             if self.show_uid: line += f"\n　`{r['uid']}`"
             lines.append(line)
         active = sum(1 for r in self.rows if r["active"])
-        e = discord.Embed(title=f"VRChat 登録フレンド ({active}人)", description="\n".join(lines), color=0x3498DB)
-        e.set_footer(text=f"ページ {self.page + 1}/{self.pages}")
+        e = discord.Embed(title=tr("VRChat 登録フレンド ({n}人)", n=active), description="\n".join(lines), color=0x3498DB)
+        e.set_footer(text=tr("ページ {p}/{n}", p=self.page + 1, n=self.pages))
         return e
 
     async def interaction_check(self, i):
         if i.user.id != OWNER:
-            await i.response.send_message("所有者のみ操作できます。", ephemeral=True)
+            await i.response.send_message(tr("所有者のみ操作できます。"), ephemeral=True)
             return False
         return True
 
@@ -396,7 +422,7 @@ class FriendGroup(app_commands.Group):
 
     async def interaction_check(self, i: discord.Interaction):
         if i.user.id != OWNER or i.channel_id != MAIN_CH:
-            await i.response.send_message("メインチャンネルで所有者のみ実行できます。", ephemeral=True)
+            await i.response.send_message(tr("メインチャンネルで所有者のみ実行できます。"), ephemeral=True)
             return False
         return True
 
@@ -418,32 +444,32 @@ class FriendGroup(app_commands.Group):
         uid = extract_uid(url)
         if not uid:
             return await i.response.send_message(
-                "URLの形式が不正です。`https://vrchat.com/home/user/usr_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` を指定してください。")
+                tr("URLの形式が不正です。`https://vrchat.com/home/user/usr_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` を指定してください。"))
         await i.response.defer()
         try:
             u = await self.vrc_call(self.bot.vrc.get_user, uid)
         except Exception as e:
             log.warning("add: get_user failed uid=%s: %r", uid, e)
-            return await i.followup.send(f"❌ {explain_error(e)}")
+            return await i.followup.send(tr("❌ {msg}", msg=explain_error(e)))
         async with self.add_lock:
             existing = self.bot.db.get(uid)
             if existing and existing["active"]:
-                return await i.followup.send(f"すでに登録済みです: **{esc(existing['name'])}** <#{existing['channel_id']}>")
+                return await i.followup.send(tr("すでに登録済みです: **{name}** <#{ch}>", name=esc(existing["name"]), ch=existing["channel_id"]))
             try:
                 ch = await self.bot.friend_channel(uid, u["name"])
             except discord.HTTPException as e:
                 log.exception("add: channel creation failed uid=%s", uid)
-                return await i.followup.send(f"❌ チャンネル作成に失敗しました (Botの権限を確認): {e.status}")
+                return await i.followup.send(tr("❌ チャンネル作成に失敗しました (Botの権限を確認): {status}", status=e.status))
             self.bot.db.upsert(uid, u["name"], ch.id)
         self.bot.seed(uid, u)
         self.bot.stats.reconcile(uid, uid in self.bot.ingame, u["status"])
         log.info("friend added by=%s uid=%s name=%s rejoin=%s", i.user.id, uid, u["name"], bool(existing))
-        warn = "" if u["is_friend"] else "\n⚠️ このアカウントとフレンドではないため、通知は届きません。"
-        e = discord.Embed(title="➕ メンバー追加" + ("(再登録)" if existing else ""),
+        warn = "" if u["is_friend"] else tr("\n⚠️ このアカウントとフレンドではないため、通知は届きません。")
+        e = discord.Embed(title=tr("➕ メンバー追加") + (tr("(再登録)") if existing else ""),
                           description=f"**{esc(u['name'])}**\n`{uid}`", color=0x2ECC71)
         try: await ch.send(embed=e)
         except discord.HTTPException: log.exception("add: failed to write log to member channel")
-        await i.followup.send(f"✅ 追加しました: **{esc(u['name'])}** → {ch.mention}{warn}", embed=e)
+        await i.followup.send(tr("✅ 追加しました: **{name}** → {ch}{warn}", name=esc(u["name"]), ch=ch.mention, warn=warn), embed=e)
 
     # ---------- /friend remove ----------
     def resolve(self, value):
@@ -452,11 +478,11 @@ class FriendGroup(app_commands.Group):
         uid = extract_uid(value)
         if uid:
             row = self.bot.db.get(uid)
-            return (row, None) if row and row["active"] else (None, "その登録は存在しません。")
+            return (row, None) if row and row["active"] else (None, tr("その登録は存在しません。"))
         hits = [r for r in self.bot.db.active() if (r["name"] or "").lower() == value.lower()]
         if len(hits) == 1: return hits[0], None
-        if len(hits) > 1: return None, "同名のユーザーが複数います。候補一覧から選択してください。"
-        return None, "その登録は存在しません。候補一覧から選択してください。"
+        if len(hits) > 1: return None, tr("同名のユーザーが複数います。候補一覧から選択してください。")
+        return None, tr("その登録は存在しません。候補一覧から選択してください。")
 
     @app_commands.command(name="remove", description="登録済みフレンドを削除 (チャンネルは残ります)")
     @app_commands.describe(target="候補から選択 (表示名の末尾はUIDの下6桁)")
@@ -464,8 +490,8 @@ class FriendGroup(app_commands.Group):
         row, err = self.resolve(target)
         if err:
             return await i.response.send_message(err)
-        e = discord.Embed(title="このメンバーを削除しますか？", color=0xE67E22,
-                          description=f"**{esc(row['name'])}**\n`{row['uid']}`\nチャンネル: <#{row['channel_id']}> (削除されません)")
+        e = discord.Embed(title=tr("このメンバーを削除しますか？"), color=0xE67E22,
+                          description=tr("**{name}**\n`{uid}`\nチャンネル: <#{ch}> (削除されません)", name=esc(row["name"]), uid=row["uid"], ch=row["channel_id"]))
         view = ConfirmRemove(self.bot, row)
         await i.response.send_message(embed=e, view=view)
         view.message = await i.original_response()
@@ -498,7 +524,7 @@ class FriendGroup(app_commands.Group):
     async def list_(self, i: discord.Interaction, show_uid: bool = False, include_removed: bool = False):
         rows = self.bot.db.all() if include_removed else self.bot.db.active()
         if not rows:
-            return await i.response.send_message("登録なし")
+            return await i.response.send_message(tr("登録なし"))
         view = ListView(rows, show_uid)
         if view.pages == 1:
             return await i.response.send_message(embed=view.embed())
