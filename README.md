@@ -124,9 +124,8 @@ Use the `/lang` command to change the bot's display language.
 
 | Command | Description |
 |---|---|
-| `/lang` | Displays the currently selected language. |
-| `/lang language:ja` | Switches the display language to Japanese. |
-| `/lang language:en` | Switches the display language to English. |
+| `/lang code:ja` | Switches the display language to Japanese. |
+| `/lang code:en` | Switches the display language to English. |
 
 The language setting is shared by the bot and saved in its database.
 
