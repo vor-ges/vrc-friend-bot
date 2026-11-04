@@ -319,3 +319,51 @@ _d2 = _c2.to_dict(_t2); _o2 = _d2["options"][0]
 assert _d2["name"] == "lang" and len(_d2["options"]) == 1
 assert _o2["name"] == "code" and _o2["type"] == 3 and _o2.get("required") is True and not _o2.get("choices") and _o2["min_length"] == 2
 print("LANG TESTS PASSED")
+
+# ================= メンション切り替え (/mention) =================
+async def run6():
+    bot = B.Bot(); bot.vrc = FakeVRC(); bot.db = DB(":memory:"); bot.stats = Stats(bot.db.c, JST)
+    bot.db.upsert("usr_a", "Alice", 111)
+    sent = []
+    async def fake_send(uid, **kw): sent.append(kw)
+    bot.send_to = fake_send
+    ev = lambda t, **c: bot.handle({"type": t, "content": {"userId": "usr_a", **c}})
+    online = lambda: ev("friend-online", platform="standalonewindows", location="private", user={"status": "active"})
+    assert bot.mention_on is True                                              # 既定はオン(従来動作)
+    await online(); assert sent[-1]["content"] == f"<@{B.OWNER}>" and sent[-1]["embed"].title.startswith("🟢")
+    await ev("friend-offline"); assert sent[-1].get("content") is None          # オンライン以外はメンションしない
+    cmd = bot.make_mention_command().callback
+    i = FI(1, 2); await cmd(i, "off"); assert i.out[1].get("ephemeral") and bot.mention_on is True      # 他人は変更不可
+    i = FI(99, 2); await cmd(i, "x"); assert i.out[1].get("ephemeral") and bot.mention_on is True       # 不正な値は無視
+    i = FI(99, 2); await cmd(i, "off"); assert bot.mention_on is False and i.out[0].startswith("🔕") and "オフ" in i.out[0]
+    assert bot.get_setting("mention") == "0"                                    # DBに保存
+    n = len(sent); await online()                                               # オフでも通知自体は送る(メンションだけ外す)
+    assert len(sent) == n + 1 and sent[-1]["content"] is None and sent[-1]["embed"].title.startswith("🟢")
+    # /friend list に状態を表示(全体設定なので先頭に1行)
+    g = B.FriendGroup(bot); i = FI(99, 2); await g.list_.callback(g, i, False, False)
+    assert i.out[1]["embed"].description.startswith("🔕 オンライン通知のメンション: オフ") and "Alice" in i.out[1]["embed"].description
+    i = FI(99, 2); await cmd(i, "on"); assert bot.mention_on is True and i.out[0].startswith("🔔") and "オン" in i.out[0]
+    await ev("friend-offline"); await online(); assert sent[-1]["content"] == f"<@{B.OWNER}>"
+    i = FI(99, 2); await g.list_.callback(g, i, False, False); assert i.out[1]["embed"].description.startswith("🔔 オンライン通知のメンション: オン")
+    # 英語
+    i18n.set_lang("en")
+    i = FI(99, 2); await cmd(i, "off"); assert i.out[0] == "🔕 Online mention turned OFF."
+    i = FI(99, 2); await cmd(i, "x"); assert i.out[0] == "Please specify on or off."
+    i = FI(99, 2); await g.list_.callback(g, i, False, False); assert i.out[1]["embed"].description.startswith("🔕 Online mention: OFF")
+    i = FI(99, 2); await cmd(i, "on"); assert i.out[0] == "🔔 Online mention turned ON."
+    i18n.set_lang("ja")
+    assert "オンライン通知のメンション" not in B.ListView(bot.db.active(), False).embed().description   # 引数なしなら従来表示
+asyncio.run(run6())
+
+# 再起動しても設定が残る (ファイルDBで確認)
+_b1 = B.Bot(); assert _b1.mention_on is True
+_b1.set_setting("mention", "0"); _b2 = B.Bot(); assert _b2.mention_on is False
+_b2.set_setting("mention", "1"); assert B.Bot().mention_on is True
+
+# スラッシュコマンド定義 (state: on/off の選択肢・必須)
+_t3 = app_commands.CommandTree(discord.Client(intents=discord.Intents.default()))
+_c3 = B.Bot().make_mention_command(); _t3.add_command(_c3, guild=discord.Object(1))
+_d3 = _c3.to_dict(_t3); _o3 = _d3["options"][0]
+assert _d3["name"] == "mention" and _o3["name"] == "state" and _o3.get("required") is True and [c["value"] for c in _o3["choices"]] == ["on", "off"]
+assert len(_d3["description"]) <= 100
+print("MENTION TESTS PASSED")

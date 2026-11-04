@@ -60,11 +60,13 @@ class Bot(commands.Bot):
         self.ingame = set()    # 現在VRChat(ゲーム内)にログイン中と判断しているUID
         self.stats = Stats(self.db.c, make_tz(os.environ.get("STATS_TZ", "Asia/Tokyo")))
         i18n.load(self.db.c)  # 保存済みの表示言語を読み込む
+        self.mention_on = self.get_setting("mention", "1") == "1"  # オンライン通知のメンション(既定オン)
 
     async def setup_hook(self):
         self.tree.add_command(FriendGroup(self), guild=discord.Object(GUILD_ID))
         self.tree.add_command(self.make_stats_command(), guild=discord.Object(GUILD_ID))
         self.tree.add_command(self.make_lang_command(), guild=discord.Object(GUILD_ID))
+        self.tree.add_command(self.make_mention_command(), guild=discord.Object(GUILD_ID))
         await self.tree.sync(guild=discord.Object(GUILD_ID))
         await asyncio.to_thread(self.vrc.login)
         asyncio.create_task(self.heartbeat())
@@ -198,6 +200,32 @@ class Bot(commands.Bot):
             await i.response.send_message(tr("言語を {name} に切り替えました。", name=LANGS[language]))
         return app_commands.Command(name="lang", description="表示言語の切り替え / Switch language: /lang en, /lang ja", callback=lang)
 
+    # ---------- /mention ----------
+    def get_setting(self, k, default=None):
+        self.db.c.execute("CREATE TABLE IF NOT EXISTS bot_settings(k TEXT PRIMARY KEY, v TEXT)")
+        r = self.db.c.execute("SELECT v FROM bot_settings WHERE k=?", (k,)).fetchone()
+        return r[0] if r else default
+
+    def set_setting(self, k, v):
+        self.db.c.execute("CREATE TABLE IF NOT EXISTS bot_settings(k TEXT PRIMARY KEY, v TEXT)")
+        self.db.c.execute("INSERT INTO bot_settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+        self.db.c.commit()
+
+    def make_mention_command(self):
+        @app_commands.describe(state="on / off")
+        @app_commands.choices(state=[app_commands.Choice(name="on", value="on"), app_commands.Choice(name="off", value="off")])
+        async def mention(i: discord.Interaction, state: str):
+            if i.user.id != OWNER:
+                return await i.response.send_message(tr("所有者のみ実行できます。"), ephemeral=True)
+            if state not in ("on", "off"):
+                return await i.response.send_message(tr("on か off を指定してください。"), ephemeral=True)
+            self.mention_on = state == "on"
+            self.set_setting("mention", "1" if self.mention_on else "0")  # 再起動後も保持
+            log.info("online mention set by=%s state=%s", i.user.id, state)
+            await i.response.send_message(tr("🔔 オンライン通知のメンションをオンにしました。") if self.mention_on
+                                          else tr("🔕 オンライン通知のメンションをオフにしました。"))
+        return app_commands.Command(name="mention", description="オンライン通知のメンション切り替え / Toggle online mention: /mention on|off", callback=mention)
+
     # ---------- WebSocket ----------
     async def ws_loop(self):
         backoff = 5
@@ -238,7 +266,7 @@ class Bot(commands.Bot):
             loc = c.get("location") or (user.get("location"))
             self.last_loc[uid] = loc
             await self.world_embed_fields(loc, e)
-            await self.send_to(uid, content=f"<@{OWNER}>", embed=e)  # メンションはオンラインのみ
+            await self.send_to(uid, content=f"<@{OWNER}>" if self.mention_on else None, embed=e)  # メンションはオンラインのみ(/mention でオフ可)
         elif t in ("friend-offline", "friend-active"):
             # friend-active(Webのみ)は、ゲームを終了してWebだけ残った場合も含むので「ゲームから抜けた」扱い
             self.last_loc.pop(uid, None)
@@ -367,9 +395,10 @@ class ConfirmRemove(discord.ui.View):
 class ListView(discord.ui.View):
     PER = 10
 
-    def __init__(self, rows, show_uid):
+    def __init__(self, rows, show_uid, mention=None):
         super().__init__(timeout=120)
         self.rows, self.show_uid, self.page, self.message = rows, show_uid, 0, None
+        self.mention = mention  # None=表示しない / True,False=オンライン通知のメンション設定
         self.pages = max(1, -(-len(rows) // self.PER))
         self._sync()
 
@@ -386,7 +415,9 @@ class ListView(discord.ui.View):
             if self.show_uid: line += f"\n　`{r['uid']}`"
             lines.append(line)
         active = sum(1 for r in self.rows if r["active"])
-        e = discord.Embed(title=tr("VRChat 登録フレンド ({n}人)", n=active), description="\n".join(lines), color=0x3498DB)
+        head = "" if self.mention is None else (tr("🔔 オンライン通知のメンション: オン") if self.mention
+                                                 else tr("🔕 オンライン通知のメンション: オフ")) + "\n\n"
+        e = discord.Embed(title=tr("VRChat 登録フレンド ({n}人)", n=active), description=head + "\n".join(lines), color=0x3498DB)
         e.set_footer(text=tr("ページ {p}/{n}", p=self.page + 1, n=self.pages))
         return e
 
@@ -524,7 +555,7 @@ class FriendGroup(app_commands.Group):
         rows = self.bot.db.all() if include_removed else self.bot.db.active()
         if not rows:
             return await i.response.send_message(tr("登録なし"))
-        view = ListView(rows, show_uid)
+        view = ListView(rows, show_uid, self.bot.mention_on)
         if view.pages == 1:
             return await i.response.send_message(embed=view.embed())
         await i.response.send_message(embed=view.embed(), view=view)

@@ -100,6 +100,11 @@ TABLES = {
         # --- /lang ---
         "言語を {name} に切り替えました。": "Language switched to {name}.",
         "未対応の言語です。使用できるコード: {codes}": "Unsupported language. Available codes: {codes}",
+        "🔔 オンライン通知のメンション: オン": "🔔 Online mention: ON",
+        "🔕 オンライン通知のメンション: オフ": "🔕 Online mention: OFF",
+        "🔔 オンライン通知のメンションをオンにしました。": "🔔 Online mention turned ON.",
+        "🔕 オンライン通知のメンションをオフにしました。": "🔕 Online mention turned OFF.",
+        "on か off を指定してください。": "Please specify on or off.",
         # --- VRChat APIのエラー (vrc.explain_error) ---
         "VRChat APIの応答がタイムアウトしました。少し待って再試行してください。": "The VRChat API timed out. Please wait a moment and try again.",
         "VRChatの再認証(2FA)が必要です。サーバーで `python bot.py` を手動起動して認証してください。":
