@@ -157,11 +157,7 @@ Use `.env.example` to provide a configuration template without exposing actual c
 
 ## Version
 
-<<<<<<< Updated upstream
 1.2.1
-=======
-1.1.1
->>>>>>> Stashed changes
 
 ## Development
 
