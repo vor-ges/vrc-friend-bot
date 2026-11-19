@@ -26,7 +26,7 @@ db = DB(":memory:")
 def uid(n): return f"usr_{n:08x}-0000-0000-0000-000000000000"
 for n in range(40): db.upsert(uid(n), "Alice" if n < 3 else f"User{n}", 1000 + n)
 db.upsert(uid(99), "Gone", 5); db.deactivate(uid(99))
-g = B.FriendGroup(types.SimpleNamespace(db=db))
+g = B.FriendCommands(types.SimpleNamespace(db=db))
 async def run():
     owner, other = types.SimpleNamespace(user=types.SimpleNamespace(id=99)), types.SimpleNamespace(user=types.SimpleNamespace(id=1))
     assert await g.remove_ac(other, "") == []
@@ -340,30 +340,116 @@ async def run6():
     n = len(sent); await online()                                               # オフでも通知自体は送る(メンションだけ外す)
     assert len(sent) == n + 1 and sent[-1]["content"] is None and sent[-1]["embed"].title.startswith("🟢")
     # /friend list に状態を表示(全体設定なので先頭に1行)
-    g = B.FriendGroup(bot); i = FI(99, 2); await g.list_.callback(g, i, False, False)
-    assert i.out[1]["embed"].description.startswith("🔕 オンライン通知のメンション: オフ") and "Alice" in i.out[1]["embed"].description
+    g = B.FriendCommands(bot); i = FI(99, 2); await g.do_list(i, False, False)
+    assert i.out[1]["embed"].description.startswith("🔕 オンライン通知のメンション(全体設定): オフ") and "Alice" in i.out[1]["embed"].description
     i = FI(99, 2); await cmd(i, "on"); assert bot.mention_on is True and i.out[0].startswith("🔔") and "オン" in i.out[0]
     await ev("friend-offline"); await online(); assert sent[-1]["content"] == f"<@{B.OWNER}>"
-    i = FI(99, 2); await g.list_.callback(g, i, False, False); assert i.out[1]["embed"].description.startswith("🔔 オンライン通知のメンション: オン")
+    i = FI(99, 2); await g.do_list(i, False, False); assert i.out[1]["embed"].description.startswith("🔔 オンライン通知のメンション(全体設定): オン")
     # 英語
     i18n.set_lang("en")
-    i = FI(99, 2); await cmd(i, "off"); assert i.out[0] == "🔕 Online mention turned OFF."
-    i = FI(99, 2); await cmd(i, "x"); assert i.out[0] == "Please specify on or off."
-    i = FI(99, 2); await g.list_.callback(g, i, False, False); assert i.out[1]["embed"].description.startswith("🔕 Online mention: OFF")
-    i = FI(99, 2); await cmd(i, "on"); assert i.out[0] == "🔔 Online mention turned ON."
+    i = FI(99, 2); await cmd(i, "off"); assert i.out[0] == "🔕 Online mention (global) turned OFF."
+    i = FI(99, 2); await cmd(i, "x"); assert i.out[0] == "Please specify on, off or reset."
+    i = FI(99, 2); await g.do_list(i, False, False); assert i.out[1]["embed"].description.startswith("🔕 Online mention (global): OFF")
+    i = FI(99, 2); await cmd(i, "on"); assert i.out[0] == "🔔 Online mention (global) turned ON."
     i18n.set_lang("ja")
     assert "オンライン通知のメンション" not in B.ListView(bot.db.active(), False).embed().description   # 引数なしなら従来表示
 asyncio.run(run6())
+
+# ---- フレンド別のメンション ----
+async def run7():
+    bot = B.Bot(); bot.vrc = FakeVRC(); bot.db = DB(":memory:"); bot.stats = Stats(bot.db.c, JST)
+    bot.db.upsert("usr_a", "Alice", 111); bot.db.upsert("usr_b", "Bob*", 222); bot.db.upsert("usr_c", "Gone", 333); bot.db.deactivate("usr_c")
+    sent = []
+    async def fake_send(uid, **kw): sent.append((uid, kw.get("content")))
+    bot.send_to = fake_send
+    async def online(uid):
+        await bot.handle({"type": "friend-online", "content": {"userId": uid, "platform": "android", "location": "private", "user": {"status": "active"}}})
+        n = sent[-1]; await bot.handle({"type": "friend-offline", "content": {"userId": uid}}); return n
+    M = f"<@{B.OWNER}>"
+    cmd = bot.make_mention_command().callback
+    assert [await online(u) for u in ("usr_a", "usr_b")] == [("usr_a", M), ("usr_b", M)]          # 既定: 全員メンション
+    i = FI(99, 111); await cmd(i, "off")                                                           # Aliceのチャンネルでoff -> Aliceだけ
+    assert i.out[0].startswith("🔕") and "Alice" in i.out[0] and bot.mention_on is True
+    assert bot.get_setting("mention:usr_a") == "0" and bot.get_setting("mention") is None or bot.get_setting("mention") == "1"
+    assert [await online(u) for u in ("usr_a", "usr_b")] == [("usr_a", None), ("usr_b", M)]
+    i = FI(99, 2); await cmd(i, "off")                                                             # メインでoff -> 全体(個別設定のないBobが対象)
+    assert "全体設定" in i.out[0] and [await online(u) for u in ("usr_a", "usr_b")] == [("usr_a", None), ("usr_b", None)]
+    i = FI(99, 111); await cmd(i, "on")                                                            # 個別onは全体offより優先
+    assert i.out[0].startswith("🔔") and [await online(u) for u in ("usr_a", "usr_b")] == [("usr_a", M), ("usr_b", None)]
+    i = FI(99, 111); await cmd(i, "reset")                                                         # reset -> 全体設定(off)に従う
+    assert "全体設定に戻しました" in i.out[0] and "オフ" in i.out[0] and bot.get_setting("mention:usr_a") is None
+    assert (await online("usr_a")) == ("usr_a", None)
+    i = FI(99, 2); await cmd(i, "on"); assert (await online("usr_a")) == ("usr_a", M)               # 全体onに戻せば個別なしのAliceも追従
+    i = FI(99, 2); await cmd(i, "reset"); assert i.out[1].get("ephemeral") and "フレンド用チャンネル" in i.out[0]  # メインでresetは不可
+    i = FI(99, 999); await cmd(i, "off"); assert i.out[1].get("ephemeral") and "メインチャンネルか" in i.out[0]   # 無関係チャンネルは不可
+    i = FI(1, 111); await cmd(i, "off"); assert i.out[1].get("ephemeral") and bot.get_setting("mention:usr_a") is None  # 他人は不可
+    i = FI(99, 333); await cmd(i, "off"); assert "Gone" in i.out[0]                                # 削除済みフレンドのチャンネルでも設定可
+    i = FI(99, 222); await cmd(i, "off"); assert "Bob\\*" in i.out[0]                                # 名前はエスケープ
+    # 一覧: 左の印=メンション状態、個別設定には(個別)
+    bot.del_setting("mention:usr_c"); bot.mention_on = True
+    i = FI(99, 111); await cmd(i, "off")                                                           # Alice=個別off / Bob=個別off(上で設定)
+    i = FI(99, 222); await cmd(i, "reset")                                                         # Bobを全体(on)に戻す
+    g = B.FriendCommands(bot); i = FI(99, 2); await g.do_list(i, False, True)               # 削除済みも表示
+    d = i.out[1]["embed"].description
+    row = lambda n: next(l for l in d.split("\n") if n in l)       # 名前を含む行(名前はMarkdownエスケープされる)
+    assert row("Alice").startswith("🔕") and "(個別)" in row("Alice")
+    assert row("Bob").startswith("🔔") and "(個別)" not in row("Bob")
+    assert row("Gone").startswith("🚫") and "✅" not in d and "(個別)=フレンド別の設定" in d
+    i18n.set_lang("en")
+    i = FI(99, 111); await cmd(i, "on"); assert i.out[0] == "🔔 Online mention for Alice turned ON."
+    i = FI(99, 111); await cmd(i, "reset"); assert i.out[0] == "↩️ Alice now follows the global setting (ON)."
+    i = FI(99, 111); await cmd(i, "off"); i = FI(99, 2); await g.do_list(i, False, False)
+    assert "(custom)" in i.out[1]["embed"].description and "per-friend setting" in i.out[1]["embed"].description
+    i = FI(99, 2); await cmd(i, "reset"); assert i.out[0] == "Use reset in a friend's channel."
+    i18n.set_lang("ja")
+    assert "✅" in B.ListView(bot.db.active(), False).embed().description                          # 設定情報なしなら従来の✅
+asyncio.run(run7())
 
 # 再起動しても設定が残る (ファイルDBで確認)
 _b1 = B.Bot(); assert _b1.mention_on is True
 _b1.set_setting("mention", "0"); _b2 = B.Bot(); assert _b2.mention_on is False
 _b2.set_setting("mention", "1"); assert B.Bot().mention_on is True
+_b2.set_setting("mention:usr_z", "0"); _b3 = B.Bot(); assert _b3.mention_for("usr_z") is False and _b3.mention_overrides() == {"usr_z": False}
+_b3.del_setting("mention:usr_z"); assert B.Bot().mention_overrides() == {} and B.Bot().mention_for("usr_z") is True
 
 # スラッシュコマンド定義 (state: on/off の選択肢・必須)
 _t3 = app_commands.CommandTree(discord.Client(intents=discord.Intents.default()))
 _c3 = B.Bot().make_mention_command(); _t3.add_command(_c3, guild=discord.Object(1))
 _d3 = _c3.to_dict(_t3); _o3 = _d3["options"][0]
-assert _d3["name"] == "mention" and _o3["name"] == "state" and _o3.get("required") is True and [c["value"] for c in _o3["choices"]] == ["on", "off"]
+assert _d3["name"] == "mention" and _o3["name"] == "state" and _o3.get("required") is True and [c["value"] for c in _o3["choices"]] == ["on", "off", "reset"]
 assert len(_d3["description"]) <= 100
 print("MENTION TESTS PASSED")
+
+# ================= コマンド体系: すべてトップレベルの1語コマンド (グループ/サブコマンドなし) =================
+async def run8():
+    bot = B.Bot(); bot.db = DB(":memory:"); bot.stats = Stats(bot.db.c, JST)
+    bot.db.upsert("usr_a", "Alice", 111)
+    fc = B.FriendCommands(bot)
+    cmds = fc.commands() + [bot.make_stats_command(), bot.make_lang_command(), bot.make_mention_command()]
+    assert sorted(c.name for c in cmds) == ["add", "lang", "list", "mention", "remove", "stats"]
+    assert all(isinstance(c, app_commands.Command) and re.fullmatch(r"[a-z]+", c.name) for c in cmds)   # 1語・グループではない
+    tree = app_commands.CommandTree(discord.Client(intents=discord.Intents.default()))
+    for c in cmds: tree.add_command(c, guild=discord.Object(1))
+    d = {x.name: x.to_dict(tree) for x in tree.get_commands(guild=discord.Object(1))}
+    assert all(x["type"] == 1 and len(x["description"]) <= 100 for x in d.values())
+    assert not any(o["type"] in (1, 2) for x in d.values() for o in x.get("options", []))            # サブコマンド/サブコマンドグループなし
+    assert [o["name"] for o in d["add"]["options"]] == ["url"] and d["add"]["options"][0]["required"] is True
+    assert [(o["name"], o["type"]) for o in d["list"]["options"]] == [("show_uid", 5), ("include_removed", 5)]
+    assert d["remove"]["options"][0]["name"] == "target" and d["remove"]["options"][0]["autocomplete"] is True
+    # setup_hook が全部登録している / グループ方式に戻っていない
+    hook = inspect.getsource(B.Bot.setup_hook)
+    assert all(x in hook for x in ("FriendCommands(self).commands()", "make_stats_command", "make_lang_command", "make_mention_command"))
+    assert "app_commands.Group" not in open(B.__file__).read() and "friend" not in str(sorted(d))
+    # removeのオートコンプリートがコマンド経由で動く(所有者のみ・UIDが値)
+    remove_cmd = next(c for c in cmds if c.name == "remove")
+    ac = remove_cmd._params["target"].autocomplete
+    r = await ac(FI(99, 2), "ali"); assert [(x.name.split(" ")[0], x.value) for x in r] == [("Alice", "usr_a")]
+    assert await ac(FI(1, 2), "ali") == []
+    # 権限: メインチャンネル以外・他人はどのコマンドも拒否(以前のグループ全体のチェックと同じ)
+    for call in (lambda i: fc.do_add(i, "usr_x"), lambda i: fc.do_remove(i, "usr_a"), lambda i: fc.do_list(i)):
+        for who, ch in ((99, 999), (1, 2)):
+            i = FI(who, ch); await call(i); assert i.out[1].get("ephemeral") and "メインチャンネルで所有者のみ" in i.out[0], (who, ch)
+    i = FI(99, 2); await fc.do_list(i); assert "Alice" in i.out[1]["embed"].description         # 正規の場所なら動く
+    i = FI(99, 2); await fc.do_add(i, "not-a-url"); assert "URLの形式が不正" in i.out[0]
+asyncio.run(run8())
+print("COMMAND TESTS PASSED")
