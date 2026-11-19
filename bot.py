@@ -63,7 +63,8 @@ class Bot(commands.Bot):
         self.mention_on = self.get_setting("mention", "1") == "1"  # オンライン通知のメンション(既定オン)
 
     async def setup_hook(self):
-        self.tree.add_command(FriendGroup(self), guild=discord.Object(GUILD_ID))
+        for c in FriendCommands(self).commands():  # /add /remove /list (トップレベルの1語コマンド)
+            self.tree.add_command(c, guild=discord.Object(GUILD_ID))
         self.tree.add_command(self.make_stats_command(), guild=discord.Object(GUILD_ID))
         self.tree.add_command(self.make_lang_command(), guild=discord.Object(GUILD_ID))
         self.tree.add_command(self.make_mention_command(), guild=discord.Object(GUILD_ID))
@@ -211,20 +212,53 @@ class Bot(commands.Bot):
         self.db.c.execute("INSERT INTO bot_settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
         self.db.c.commit()
 
+    def del_setting(self, k):
+        self.db.c.execute("CREATE TABLE IF NOT EXISTS bot_settings(k TEXT PRIMARY KEY, v TEXT)")
+        self.db.c.execute("DELETE FROM bot_settings WHERE k=?", (k,))
+        self.db.c.commit()
+
+    def mention_for(self, uid):
+        """そのフレンドにメンションするか。フレンド別の設定(mention:<uid>)があればそれを優先、なければ全体設定。"""
+        v = self.get_setting(f"mention:{uid}")
+        return self.mention_on if v is None else v == "1"
+
+    def mention_overrides(self):
+        self.db.c.execute("CREATE TABLE IF NOT EXISTS bot_settings(k TEXT PRIMARY KEY, v TEXT)")
+        return {r[0][len("mention:"):]: r[1] == "1"
+                for r in self.db.c.execute("SELECT k,v FROM bot_settings WHERE k LIKE 'mention:%'")}
+
     def make_mention_command(self):
-        @app_commands.describe(state="on / off")
-        @app_commands.choices(state=[app_commands.Choice(name="on", value="on"), app_commands.Choice(name="off", value="off")])
+        @app_commands.describe(state="on / off / reset (reset: フレンド用チャンネルで個別設定を解除)")
+        @app_commands.choices(state=[app_commands.Choice(name=x, value=x) for x in ("on", "off", "reset")])
         async def mention(i: discord.Interaction, state: str):
             if i.user.id != OWNER:
                 return await i.response.send_message(tr("所有者のみ実行できます。"), ephemeral=True)
-            if state not in ("on", "off"):
-                return await i.response.send_message(tr("on か off を指定してください。"), ephemeral=True)
-            self.mention_on = state == "on"
-            self.set_setting("mention", "1" if self.mention_on else "0")  # 再起動後も保持
-            log.info("online mention set by=%s state=%s", i.user.id, state)
-            await i.response.send_message(tr("🔔 オンライン通知のメンションをオンにしました。") if self.mention_on
-                                          else tr("🔕 オンライン通知のメンションをオフにしました。"))
-        return app_commands.Command(name="mention", description="オンライン通知のメンション切り替え / Toggle online mention: /mention on|off", callback=mention)
+            if state not in ("on", "off", "reset"):
+                return await i.response.send_message(tr("on / off / reset を指定してください。"), ephemeral=True)
+            on = state == "on"
+            if i.channel_id == MAIN_CH:  # メインチャンネル: 全体設定 (フレンド別の設定がないフレンドに適用)
+                if state == "reset":
+                    return await i.response.send_message(tr("reset はフレンド用チャンネルで使います。"), ephemeral=True)
+                self.mention_on = on
+                self.set_setting("mention", "1" if on else "0")  # 再起動後も保持
+                log.info("online mention (global) set by=%s state=%s", i.user.id, state)
+                return await i.response.send_message(tr("🔔 オンライン通知のメンション(全体設定)をオンにしました。") if on
+                                                     else tr("🔕 オンライン通知のメンション(全体設定)をオフにしました。"))
+            row = next((r for r in self.db.all() if r["channel_id"] == i.channel_id), None)  # フレンド用チャンネル: そのフレンドだけ
+            if not row:
+                return await i.response.send_message(
+                    tr("メインチャンネルか、フレンド用チャンネルで実行してください。"), ephemeral=True)
+            name = esc(row["name"])
+            if state == "reset":
+                self.del_setting(f"mention:{row['uid']}")
+                log.info("online mention reset by=%s uid=%s", i.user.id, row["uid"])
+                return await i.response.send_message(tr("↩️ {name} のメンションを全体設定に戻しました (現在: {state})。",
+                                                        name=name, state=tr("オン") if self.mention_on else tr("オフ")))
+            self.set_setting(f"mention:{row['uid']}", "1" if on else "0")
+            log.info("online mention set by=%s uid=%s state=%s", i.user.id, row["uid"], state)
+            await i.response.send_message(tr("🔔 {name} のオンライン通知のメンションをオンにしました。", name=name) if on
+                                          else tr("🔕 {name} のオンライン通知のメンションをオフにしました。", name=name))
+        return app_commands.Command(name="mention", description="オンライン通知のメンション切り替え / Toggle online mention: /mention on|off|reset", callback=mention)
 
     # ---------- WebSocket ----------
     async def ws_loop(self):
@@ -266,7 +300,7 @@ class Bot(commands.Bot):
             loc = c.get("location") or (user.get("location"))
             self.last_loc[uid] = loc
             await self.world_embed_fields(loc, e)
-            await self.send_to(uid, content=f"<@{OWNER}>" if self.mention_on else None, embed=e)  # メンションはオンラインのみ(/mention でオフ可)
+            await self.send_to(uid, content=f"<@{OWNER}>" if self.mention_for(uid) else None, embed=e)  # メンションはオンラインのみ(/mention で全体/フレンド別にオフ可)
         elif t in ("friend-offline", "friend-active"):
             # friend-active(Webのみ)は、ゲームを終了してWebだけ残った場合も含むので「ゲームから抜けた」扱い
             self.last_loc.pop(uid, None)
@@ -395,10 +429,11 @@ class ConfirmRemove(discord.ui.View):
 class ListView(discord.ui.View):
     PER = 10
 
-    def __init__(self, rows, show_uid, mention=None):
+    def __init__(self, rows, show_uid, mention=None, overrides=None):
         super().__init__(timeout=120)
         self.rows, self.show_uid, self.page, self.message = rows, show_uid, 0, None
-        self.mention = mention  # None=表示しない / True,False=オンライン通知のメンション設定
+        self.mention = mention  # None=表示しない / True,False=オンライン通知のメンション(全体設定)
+        self.overrides = overrides or {}  # {uid: bool} フレンド別の設定
         self.pages = max(1, -(-len(rows) // self.PER))
         self._sync()
 
@@ -410,13 +445,19 @@ class ListView(discord.ui.View):
         chunk = self.rows[self.page * self.PER:(self.page + 1) * self.PER]
         lines = []
         for r in chunk:
-            mark = "✅" if r["active"] else tr("🚫(削除済み)")
-            line = f"{mark} **{esc(r['name'])}** <#{r['channel_id']}>"
+            custom = ""
+            if not r["active"]: mark = tr("🚫(削除済み)")
+            elif self.mention is None: mark = "✅"
+            else:  # 左の印=メンション状態 (フレンド別の設定があればそれ、なければ全体設定)
+                mark = "🔔" if self.overrides.get(r["uid"], self.mention) else "🔕"
+                if r["uid"] in self.overrides: custom = " " + tr("(個別)")
+            line = f"{mark} **{esc(r['name'])}**{custom} <#{r['channel_id']}>"
             if self.show_uid: line += f"\n　`{r['uid']}`"
             lines.append(line)
         active = sum(1 for r in self.rows if r["active"])
-        head = "" if self.mention is None else (tr("🔔 オンライン通知のメンション: オン") if self.mention
-                                                 else tr("🔕 オンライン通知のメンション: オフ")) + "\n\n"
+        head = "" if self.mention is None else (tr("🔔 オンライン通知のメンション(全体設定): オン") if self.mention
+                                                 else tr("🔕 オンライン通知のメンション(全体設定): オフ")) \
+            + "\n" + tr("🔔=メンションあり 🔕=なし (個別)=フレンド別の設定") + "\n\n"
         e = discord.Embed(title=tr("VRChat 登録フレンド ({n}人)", n=active), description=head + "\n".join(lines), color=0x3498DB)
         e.set_footer(text=tr("ページ {p}/{n}", p=self.page + 1, n=self.pages))
         return e
@@ -444,13 +485,14 @@ class ListView(discord.ui.View):
             except discord.HTTPException: pass
 
 
-class FriendGroup(app_commands.Group):
+class FriendCommands:
+    """/add /remove /list。コマンドはグループ/サブコマンドを使わず、トップレベルの1語にする(新しいコマンドも同様)。"""
     def __init__(self, bot):
-        super().__init__(name="friend", description="VRChatフレンド管理")
         self.bot = bot
         self.add_lock = asyncio.Lock()  # 同時追加でチャンネルが二重作成されるのを防ぐ
 
-    async def interaction_check(self, i: discord.Interaction):
+    async def guard(self, i: discord.Interaction):
+        """メインチャンネルで所有者のみ。拒否したらメッセージを返して False。"""
         if i.user.id != OWNER or i.channel_id != MAIN_CH:
             await i.response.send_message(tr("メインチャンネルで所有者のみ実行できます。"), ephemeral=True)
             return False
@@ -468,9 +510,8 @@ class FriendGroup(app_commands.Group):
             return await asyncio.wait_for(asyncio.to_thread(fn, *args), 20)
 
     # ---------- /friend add ----------
-    @app_commands.command(name="add", description="VRChatプロフィールURLからフレンドを追加")
-    @app_commands.describe(url="https://vrchat.com/home/user/usr_... のURL (usr_...のIDも可)")
-    async def add(self, i: discord.Interaction, url: str):
+    async def do_add(self, i: discord.Interaction, url: str):
+        if not await self.guard(i): return
         uid = extract_uid(url)
         if not uid:
             return await i.response.send_message(
@@ -514,9 +555,8 @@ class FriendGroup(app_commands.Group):
         if len(hits) > 1: return None, tr("同名のユーザーが複数います。候補一覧から選択してください。")
         return None, tr("その登録は存在しません。候補一覧から選択してください。")
 
-    @app_commands.command(name="remove", description="登録済みフレンドを削除 (チャンネルは残ります)")
-    @app_commands.describe(target="候補から選択 (表示名の末尾はUIDの下6桁)")
-    async def remove(self, i: discord.Interaction, target: str):
+    async def do_remove(self, i: discord.Interaction, target: str):
+        if not await self.guard(i): return
         row, err = self.resolve(target)
         if err:
             return await i.response.send_message(err)
@@ -526,9 +566,8 @@ class FriendGroup(app_commands.Group):
         await i.response.send_message(embed=e, view=view)
         view.message = await i.original_response()
 
-    @remove.autocomplete("target")
     async def remove_ac(self, i: discord.Interaction, current: str):
-        if i.user.id != OWNER:  # autocompleteにはinteraction_checkが効かないため明示的に制限
+        if i.user.id != OWNER:  # autocompleteには権限チェックが効かないため明示的に制限
             return []
         cur = (current or "").strip().lower()
         out, seen = [], set()
@@ -549,17 +588,40 @@ class FriendGroup(app_commands.Group):
         return out
 
     # ---------- /friend list ----------
-    @app_commands.command(name="list", description="登録一覧")
-    @app_commands.describe(show_uid="UIDも表示する", include_removed="削除済みも表示する")
-    async def list_(self, i: discord.Interaction, show_uid: bool = False, include_removed: bool = False):
+    async def do_list(self, i: discord.Interaction, show_uid: bool = False, include_removed: bool = False):
+        if not await self.guard(i): return
         rows = self.bot.db.all() if include_removed else self.bot.db.active()
         if not rows:
             return await i.response.send_message(tr("登録なし"))
-        view = ListView(rows, show_uid, self.bot.mention_on)
+        view = ListView(rows, show_uid, self.bot.mention_on, self.bot.mention_overrides())
         if view.pages == 1:
             return await i.response.send_message(embed=view.embed())
         await i.response.send_message(embed=view.embed(), view=view)
         view.message = await i.original_response()
+
+    def commands(self):
+        """トップレベルの /add /remove /list を返す"""
+        @app_commands.describe(url="https://vrchat.com/home/user/usr_... のURL (usr_...のIDも可)")
+        async def add(i: discord.Interaction, url: str):
+            await self.do_add(i, url)
+
+        @app_commands.describe(target="候補から選択 (表示名の末尾はUIDの下6桁)")
+        async def remove(i: discord.Interaction, target: str):
+            await self.do_remove(i, target)
+
+        @app_commands.describe(show_uid="UIDも表示する", include_removed="削除済みも表示する")
+        async def list_(i: discord.Interaction, show_uid: bool = False, include_removed: bool = False):
+            await self.do_list(i, show_uid, include_removed)
+
+        remove_cmd = app_commands.Command(name="remove", description="登録済みフレンドを削除 (チャンネルは残ります)", callback=remove)
+
+        @remove_cmd.autocomplete("target")
+        async def remove_autocomplete(i: discord.Interaction, current: str):
+            return await self.remove_ac(i, current)
+
+        return [app_commands.Command(name="add", description="VRChatプロフィールURLからフレンドを追加", callback=add),
+                remove_cmd,
+                app_commands.Command(name="list", description="登録一覧", callback=list_)]
 
 
 if __name__ == "__main__":

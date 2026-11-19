@@ -67,7 +67,7 @@ TABLES = {
         "👥 フレンド別 (ログイン回数順)": "👥 By friend (by logins)",
         "ゲーム内のログインのみ集計(Webのみは対象外)。集計開始後に登録したフレンドは登録後の分だけです。":
             "Only in-game logins are counted (web-only activity is excluded). Friends added after tracking began are counted from the time they were added.",
-        # --- /friend remove・list の画面部品 ---
+        # --- /remove・/list の画面部品 ---
         "所有者のみ操作できます。": "Only the owner can use this.",
         "削除する": "Remove",
         "キャンセル": "Cancel",
@@ -79,7 +79,7 @@ TABLES = {
         "🚫(削除済み)": "🚫(removed)",
         "VRChat 登録フレンド ({n}人)": "VRChat registered friends ({n})",
         "ページ {p}/{n}": "Page {p}/{n}",
-        # --- /friend ---
+        # --- /add・/remove・/list ---
         "メインチャンネルで所有者のみ実行できます。": "Only the owner can run this, and only in the main channel.",
         "URLの形式が不正です。`https://vrchat.com/home/user/usr_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` を指定してください。":
             "Invalid URL. Please provide `https://vrchat.com/home/user/usr_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.",
@@ -100,11 +100,19 @@ TABLES = {
         # --- /lang ---
         "言語を {name} に切り替えました。": "Language switched to {name}.",
         "未対応の言語です。使用できるコード: {codes}": "Unsupported language. Available codes: {codes}",
-        "🔔 オンライン通知のメンション: オン": "🔔 Online mention: ON",
-        "🔕 オンライン通知のメンション: オフ": "🔕 Online mention: OFF",
-        "🔔 オンライン通知のメンションをオンにしました。": "🔔 Online mention turned ON.",
-        "🔕 オンライン通知のメンションをオフにしました。": "🔕 Online mention turned OFF.",
-        "on か off を指定してください。": "Please specify on or off.",
+        "🔔 オンライン通知のメンション(全体設定): オン": "🔔 Online mention (global): ON",
+        "🔕 オンライン通知のメンション(全体設定): オフ": "🔕 Online mention (global): OFF",
+        "🔔=メンションあり 🔕=なし (個別)=フレンド別の設定": "🔔 = mention, 🔕 = no mention, (custom) = per-friend setting",
+        "(個別)": "(custom)",
+        "🔔 オンライン通知のメンション(全体設定)をオンにしました。": "🔔 Online mention (global) turned ON.",
+        "🔕 オンライン通知のメンション(全体設定)をオフにしました。": "🔕 Online mention (global) turned OFF.",
+        "🔔 {name} のオンライン通知のメンションをオンにしました。": "🔔 Online mention for {name} turned ON.",
+        "🔕 {name} のオンライン通知のメンションをオフにしました。": "🔕 Online mention for {name} turned OFF.",
+        "↩️ {name} のメンションを全体設定に戻しました (現在: {state})。": "↩️ {name} now follows the global setting ({state}).",
+        "オン": "ON",
+        "オフ": "OFF",
+        "reset はフレンド用チャンネルで使います。": "Use reset in a friend's channel.",
+        "on / off / reset を指定してください。": "Please specify on, off or reset.",
         # --- VRChat APIのエラー (vrc.explain_error) ---
         "VRChat APIの応答がタイムアウトしました。少し待って再試行してください。": "The VRChat API timed out. Please wait a moment and try again.",
         "VRChatの再認証(2FA)が必要です。サーバーで `python bot.py` を手動起動して認証してください。":
