@@ -310,10 +310,6 @@ The `.env` file contains sensitive information, including your Discord bot token
 
 `1.4.0`
 
-## Development
-
-This project was originally created for personal use.
-
 ## Authors
 
 - [vor_ges](https://github.com/vor-ges)
