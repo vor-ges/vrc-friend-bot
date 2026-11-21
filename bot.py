@@ -57,7 +57,11 @@ class Bot(commands.Bot):
         self.vrc = VRC(os.environ["VRC_USERNAME"], os.environ["VRC_PASSWORD"], UA)
         self.last_loc, self.last_status, self.world_cache = {}, {}, {}
         self.owner_cache = {}  # id -> (取得時刻, 名前 or None)
-        self.ingame = set()    # 現在VRChat(ゲーム内)にログイン中と判断しているUID
+        self.ingame = set()    # 現在VRChat(ゲーム内)にログイン中と判断しているUID (全フレンド分)
+        self.names = {}        # uid -> 名簿上の表示名 (変更検知用)
+        self.sync_lock = asyncio.Lock()
+        self.first_sync = True  # 起動後の最初の同期か
+        self.ws_down_at = None  # WebSocketが切れた時刻 (再接続後の同期で、見えていなかった間の離脱を閉じる位置)
         self.stats = Stats(self.db.c, make_tz(os.environ.get("STATS_TZ", "Asia/Tokyo")))
         i18n.load(self.db.c)  # 保存済みの表示言語を読み込む
         self.mention_on = self.get_setting("mention", "1") == "1"  # オンライン通知のメンション(既定オン)
@@ -71,15 +75,58 @@ class Bot(commands.Bot):
         await self.tree.sync(guild=discord.Object(GUILD_ID))
         await asyncio.to_thread(self.vrc.login)
         asyncio.create_task(self.heartbeat())
-        asyncio.create_task(self.prime_cache())
+        asyncio.create_task(self.resync_loop())
         asyncio.create_task(self.ws_loop())
 
-    async def prime_cache(self):
-        for f in self.db.active():
-            u = await self.snapshot(f["uid"])
-            if u:  # 停止中に起きたログイン/ログアウトを統計履歴に反映
-                self.stats.reconcile(f["uid"], f["uid"] in self.ingame, u["status"], close_at=self.stats.prev_alive)
-            await asyncio.sleep(1.5)
+    async def sync_friends(self):
+        """VRChat上の全フレンドの一覧を取得し、名簿・ゲーム内状態・統計履歴を最新にする(通知は送らない)。
+        起動時、WebSocketの再接続のたび、6時間ごとに実行する。"""
+        if self.sync_lock.locked():
+            return
+        async with self.sync_lock:
+            first = self.first_sync
+            close_at = self.stats.prev_alive if first else self.ws_down_at  # 見えていなかった間に離脱した人は見失った時刻で閉じる
+            try:
+                friends = await asyncio.wait_for(asyncio.to_thread(self.vrc.get_friends_all), 180)
+            except Exception as e:
+                log.warning("friend sync failed: %r", e)
+                return  # 状態(first_sync / ws_down_at)は保持して次回に持ち越す
+            self.first_sync, self.ws_down_at = False, None
+            for f in friends:
+                uid = f["uid"]
+                self.note_friend(uid, f["name"], force=True)
+                self.last_status[uid] = (f["status"], f["desc"])
+                if f["ingame"]:
+                    self.ingame.add(uid)
+                    if f["location"] != "traveling": self.last_loc[uid] = f["location"]
+                else:
+                    self.ingame.discard(uid); self.last_loc.pop(uid, None)
+                self.stats.reconcile(uid, f["ingame"], f["status"], close_at=close_at)
+            gone = self.stats.missing(f["uid"] for f in friends)
+            if len(gone) > max(5, len(friends) // 5):  # 一覧の取得不全で大量に「解除」と誤判定しないための安全弁
+                log.warning("friend sync: %d friends missing from the list; skipping unfriend marking", len(gone))
+            else:
+                for uid in gone:
+                    self.stats.mark_unfriended(uid)
+                    self.ingame.discard(uid); self.last_loc.pop(uid, None)
+                    self.stats.reconcile(uid, False, None, close_at=close_at)
+            log.info("friend sync done: %d friends, %d in game, %d unfriended", len(friends),
+                     sum(1 for f in friends if f["ingame"]), len(gone) if len(gone) <= max(5, len(friends) // 5) else 0)
+
+    async def resync_loop(self):
+        while True:
+            await asyncio.sleep(6 * 3600)  # WebSocketの取りこぼしの保険
+            await self.sync_friends()
+
+    def note_friend(self, uid, name, force=False):
+        """表示名の変更・新しいフレンドを名簿と、登録済みの表示名に反映する。"""
+        if not name and not force: return
+        if not force and self.names.get(uid) == name: return
+        row = self.db.get(uid)
+        self.stats.upsert_friend(uid, name, hint=row["added_at"] if row else None)
+        if name: self.names[uid] = name
+        if row and name and row["name"] != name:
+            self.db.c.execute("UPDATE friends SET name=? WHERE uid=?", (name, uid)); self.db.c.commit()
 
     async def heartbeat(self):
         while True:
@@ -91,14 +138,6 @@ class Bot(commands.Bot):
         self.last_status[uid] = (u["status"], u["desc"])
         if u.get("state") == "online": self.ingame.add(uid)
         else: self.ingame.discard(uid)
-
-    async def snapshot(self, uid):
-        try:
-            u = await asyncio.to_thread(self.vrc.get_user, uid)
-            self.seed(uid, u)
-            return u
-        except Exception as e:
-            log.warning("snapshot %s failed: %s", uid, e)
 
     # ---------- channels ----------
     async def friend_channel(self, uid, name):
@@ -161,29 +200,67 @@ class Bot(commands.Bot):
             if info["desc"]: embed.add_field(name=tr("説明"), value=info["desc"], inline=False)
 
     # ---------- /stats ----------
+    def who_candidates(self):
+        """/stats の対象にできる人: 名簿の全員 + 名簿にまだ無い登録済みの人 (削除済み・未登録・フレンド解除済みも含む)"""
+        known = {r["uid"]: r["name"] for r in self.stats.friends()}
+        for r in self.db.all():
+            known.setdefault(r["uid"], r["name"])
+        return [{"uid": u, "name": n} for u, n in sorted(known.items(), key=lambda kv: ((kv[1] or kv[0]).lower(), kv[0]))]
+
+    def resolve_who(self, value):
+        value = (value or "").strip()
+        known = {r["uid"]: r["name"] for r in self.who_candidates()}
+        uid = extract_uid(value)
+        if uid:
+            return (uid, None) if uid in known else (None, tr("該当するフレンドが見つかりません。候補から選択してください。"))
+        hits = [u for u, n in known.items() if (n or "").lower() == value.lower()]
+        if len(hits) == 1: return hits[0], None
+        if len(hits) > 1: return None, tr("同名のユーザーが複数います。候補一覧から選択してください。")
+        return None, tr("該当するフレンドが見つかりません。候補から選択してください。")
+
+    def stats_title(self, uid):
+        row, fr = self.db.get(uid), self.stats.friend(uid)
+        name = (row and row["name"]) or (fr and fr["name"]) or uid
+        tag = "" if row and row["active"] else (tr(" (未登録)") if not row else tr(" (削除済み)"))
+        if fr and not fr["is_friend"]: tag += tr(" (フレンド解除済み)")
+        return tr("📊 {name} のログイン統計", name=name) + tag
+
     def make_stats_command(self):
-        @app_commands.describe(days="直近何日分を集計するか (省略時は集計開始から全期間)")
-        async def stats(i: discord.Interaction, days: Optional[app_commands.Range[int, 1, 365]] = None):
+        @app_commands.describe(days="直近何日分を集計するか (省略時は収集開始から全期間)",
+                               who="フレンドを選択 (省略時は登録中の全員。削除済み・未登録の人も選べます)")
+        async def stats(i: discord.Interaction, days: Optional[app_commands.Range[int, 1, 365]] = None, who: Optional[str] = None):
             if i.user.id != OWNER:
                 return await i.response.send_message(tr("所有者のみ実行できます。"), ephemeral=True)
-            now, since = time.time(), self.stats.since()
-            start = max(since, now - days * 86400) if days else since
-            if i.channel_id == MAIN_CH:  # メインチャンネル: 登録中の全フレンド
+            now = time.time()
+            cutoff = now - days * 86400 if days else 0
+            names = None
+            if who:  # 指定したフレンドだけ (登録の有無に関係なく、収集済みのデータで分析できる)
+                uid, err = self.resolve_who(who)
+                if err:
+                    return await i.response.send_message(err, ephemeral=True)
+                uids, title = [uid], self.stats_title(uid)
+            elif i.channel_id == MAIN_CH:  # メインチャンネル: 登録中の全フレンド
                 names = {r["uid"]: r["name"] for r in self.db.active()}
                 if not names:
                     return await i.response.send_message(tr("登録フレンドがいません。"))
-                res = self.stats.summarize(list(names), start, now)
-                e = stats_embed(tr("📊 ログイン統計 (登録フレンド全員)"), res, start, now, self.stats.tz, names)
+                uids, title = list(names), tr("📊 ログイン統計 (登録フレンド全員)")
             else:  # フレンド用チャンネル: そのフレンドだけ
                 row = next((r for r in self.db.all() if r["channel_id"] == i.channel_id), None)
                 if not row:
                     return await i.response.send_message(
                         tr("メインチャンネルか、フレンド用チャンネルで実行してください。"), ephemeral=True)
-                res = self.stats.summarize([row["uid"]], start, now)
-                title = tr("📊 {name} のログイン統計", name=row["name"]) + ("" if row["active"] else tr(" (削除済み)"))
-                e = stats_embed(title, res, start, now, self.stats.tz)
-            await i.response.send_message(embed=e)
-        return app_commands.Command(name="stats", description="フレンドのログイン時間帯・ステータス使用割合の統計", callback=stats)
+                uids, title = [row["uid"]], self.stats_title(row["uid"])
+            start = max(cutoff, self.stats.tracked_since(uids))  # 収集開始日時はフレンドごと
+            res = self.stats.summarize(uids, start, now)
+            await i.response.send_message(embed=stats_embed(title, res, start, now, self.stats.tz, names))
+        cmd = app_commands.Command(name="stats", description="フレンドのログイン時間帯・ステータス使用割合の統計", callback=stats)
+
+        @cmd.autocomplete("who")
+        async def who_autocomplete(i: discord.Interaction, current: str):
+            if i.user.id != OWNER:  # autocompleteには権限チェックが効かないため明示的に制限
+                return []
+            return make_choices(self.who_candidates(), current)
+        return cmd
 
     # ---------- /lang ----------
     def make_lang_command(self):
@@ -269,9 +346,13 @@ class Bot(commands.Bot):
                 async with websockets.connect(f"wss://pipeline.vrchat.cloud/?authToken={token}",
                                               additional_headers={"User-Agent": UA}) as ws:
                     log.info("pipeline connected"); backoff = 5
-                    async for raw in ws:
-                        try: await self.handle(json.loads(raw))
-                        except Exception: log.exception("event error")
+                    asyncio.create_task(self.sync_friends())  # 切断中に変わった状態を一覧で補正
+                    try:
+                        async for raw in ws:
+                            try: await self.handle(json.loads(raw))
+                            except Exception: log.exception("event error")
+                    finally:
+                        self.ws_down_at = self.ws_down_at or time.time()
             except Exception as e:
                 log.warning("ws error: %s (retry %ss)", e, backoff)
             await asyncio.sleep(backoff); backoff = min(backoff * 2, 300)
@@ -283,30 +364,46 @@ class Bot(commands.Bot):
             except Exception: return
         if not isinstance(c, dict): return
         uid = c.get("userId") or c.get("userid")  # friend-active だけキー名が小文字
-        row = uid and self.db.get(uid)
-        if not row or not row["active"]: return
-        name = row["name"]
+        if not uid: return
         user = c.get("user") or {}
         platform = c.get("platform", "")
 
+        # 名簿(vrc_friends)と統計は、Discord登録の有無に関係なく全フレンド分を更新する
+        if t == "friend-add":
+            self.note_friend(uid, user.get("displayName"), force=True)
+            return
+        if t == "friend-delete":
+            self.stats.mark_unfriended(uid)
+            self.last_loc.pop(uid, None)
+            if uid in self.ingame:
+                self.ingame.discard(uid)
+                self.stats.record(uid, "logout")
+            return
+        self.note_friend(uid, user.get("displayName"))
+        row = self.db.get(uid)
+        notify = bool(row and row["active"])  # Discordへ通知するのは /add で登録した人だけ(ワールド情報のAPI取得もその人だけ)
+        name = row["name"] if row else None
+
         # VRChatは「ゲーム内ログイン=friend-online」「Web=friend-active」と別イベントで送る一方、
-        # friend-offline はどちらの離脱でも届く。ゲームに入っていた人の離脱だけを通知する。
+        # friend-offline はどちらの離脱でも届く。ゲームに入っていた人の離脱だけを扱う。
         if t == "friend-online":
             if platform == "web": return
             self.ingame.add(uid)
             self.stats.record(uid, "login", user.get("status") or (self.last_status.get(uid) or (None,))[0])
-            e = discord.Embed(title=tr("🟢 {name} がオンライン", name=name), color=0x2ECC71)
-            if platform: e.add_field(name=tr("プラットフォーム"), value=platform)
             loc = c.get("location") or (user.get("location"))
             self.last_loc[uid] = loc
+            if not notify: return
+            e = discord.Embed(title=tr("🟢 {name} がオンライン", name=name), color=0x2ECC71)
+            if platform: e.add_field(name=tr("プラットフォーム"), value=platform)
             await self.world_embed_fields(loc, e)
             await self.send_to(uid, content=f"<@{OWNER}>" if self.mention_for(uid) else None, embed=e)  # メンションはオンラインのみ(/mention で全体/フレンド別にオフ可)
         elif t in ("friend-offline", "friend-active"):
             # friend-active(Webのみ)は、ゲームを終了してWebだけ残った場合も含むので「ゲームから抜けた」扱い
             self.last_loc.pop(uid, None)
-            if uid not in self.ingame: return  # Webの入退室など、ゲームに入っていない人の離脱は通知しない
+            if uid not in self.ingame: return  # Webの入退室など、ゲームに入っていない人の離脱は扱わない
             self.ingame.discard(uid)
             self.stats.record(uid, "logout")
+            if not notify: return
             await self.send_to(uid, embed=discord.Embed(title=tr("⚫ {name} がオフライン", name=name), color=0x95A5A6))
         elif t == "friend-location":
             loc = c.get("location")
@@ -316,6 +413,7 @@ class Bot(commands.Bot):
                 self.stats.record(uid, "resume", (self.last_status.get(uid) or (None,))[0])
             if loc == "traveling" or loc == self.last_loc.get(uid): return
             self.last_loc[uid] = loc
+            if not notify: return
             e = discord.Embed(title=tr("🚪 {name} が移動", name=name), color=0x3498DB)
             await self.world_embed_fields(loc, e)
             await self.send_to(uid, embed=e)
@@ -326,7 +424,7 @@ class Bot(commands.Bot):
             self.last_status[uid] = (st, desc)
             if uid in self.ingame and self.stats.state(uid)[1] != st:
                 self.stats.record(uid, "status", st)  # ゲーム内でのステータス変更だけ統計に使う(比較は統計履歴上の現ステータス)
-            if old == (st, desc): return
+            if old == (st, desc) or not notify: return
             emoji, color = STATUS.get(st, ("❔", 0x95A5A6))
             e = discord.Embed(title=tr("{emoji} {name} のステータス変更", emoji=emoji, name=name), color=color)
             if old: e.add_field(name=tr("変更前"), value=f"{old[0]}\n{old[1] or '-'}")
@@ -334,6 +432,27 @@ class Bot(commands.Bot):
             await self.send_to(uid, embed=e)
 
 esc = lambda s: discord.utils.escape_markdown(discord.utils.escape_mentions(s or ""))
+
+
+def make_choices(rows, current):
+    """オートコンプリート候補(Discordの上限25件)。rows は uid/name を持つもの。値はUID。
+    同名・類似名でも区別できるようUID下6桁を付ける(衝突時は12桁→連番)。"""
+    cur = (current or "").strip().lower()
+    out, seen = [], set()
+    for r in rows:
+        name = r["name"] or r["uid"]
+        if cur and cur not in name.lower() and cur not in r["uid"]:
+            continue
+        label = f"{name[:80]} (…{r['uid'][-6:]})"
+        if label in seen: label = f"{name[:70]} (…{r['uid'][-12:]})"
+        n = 1
+        while label in seen:
+            n += 1; label = f"{name[:70]} (…{r['uid'][-12:]}) #{n}"
+        seen.add(label)
+        out.append(app_commands.Choice(name=label[:100], value=r["uid"]))
+        if len(out) >= 25:
+            break
+    return out
 
 
 def stats_embed(title, res, start, end, tz, names=None):
@@ -375,7 +494,7 @@ def stats_embed(title, res, start, end, tz, names=None):
                 lines.append(tr("**{name}** — 記録なし", name=nm))
         if len(order) > 10: lines.append(tr("…他{n}人", n=len(order) - 10))
         e.add_field(name=tr("👥 フレンド別 (ログイン回数順)"), value="\n".join(lines), inline=False)
-    e.set_footer(text=tr("ゲーム内のログインのみ集計(Webのみは対象外)。集計開始後に登録したフレンドは登録後の分だけです。"))
+    e.set_footer(text=tr("ゲーム内のログインのみ集計(Webのみは対象外)。フレンドごとの収集開始日時以降の分です。"))
     return e
 
 
@@ -399,11 +518,7 @@ class ConfirmRemove(discord.ui.View):
         if not row or not row["active"]:
             await i.response.edit_message(content=tr("すでに削除されています。"), embed=None, view=None)
             return self.stop()
-        self.bot.db.deactivate(self.uid)
-        self.bot.last_loc.pop(self.uid, None)
-        self.bot.last_status.pop(self.uid, None)
-        self.bot.stats.reconcile(self.uid, False, None)  # 削除時点でゲーム内区間を閉じる
-        self.bot.ingame.discard(self.uid)
+        self.bot.db.deactivate(self.uid)  # 通知をやめるだけ。統計の収集(名簿・ゲーム内状態)は続ける
         log.info("friend removed by=%s uid=%s name=%s", i.user.id, self.uid, row["name"])
         e = discord.Embed(title=tr("➖ メンバー削除"), description=f"**{esc(row['name'])}**\n`{self.uid}`", color=0xE74C3C)
         try:
@@ -509,40 +624,69 @@ class FriendCommands:
             await asyncio.wait_for(asyncio.to_thread(self.bot.vrc.login), 30)
             return await asyncio.wait_for(asyncio.to_thread(fn, *args), 20)
 
-    # ---------- /friend add ----------
-    async def do_add(self, i: discord.Interaction, url: str):
+    # ---------- /add ----------
+    def add_candidates(self):
+        """/add の候補: VRChat上のフレンドのうち、まだ通知登録していない人(削除済みも再登録できる)"""
+        active = {r["uid"] for r in self.bot.db.active()}
+        return [r for r in self.bot.stats.friends() if r["is_friend"] and r["uid"] not in active]
+
+    def resolve_add(self, value):
+        """入力(候補のUID・プロフィールURL・名前)から対象UIDを決める。"""
+        value = (value or "").strip()
+        uid = extract_uid(value)
+        if uid: return uid, None
+        hits = [r for r in self.add_candidates() if (r["name"] or "").lower() == value.lower()]
+        if len(hits) == 1: return hits[0]["uid"], None
+        if len(hits) > 1: return None, tr("同名のユーザーが複数います。候補一覧から選択してください。")
+        return None, tr("該当するフレンドが見つかりません。候補から選ぶか、プロフィールURL (`https://vrchat.com/home/user/usr_...`) を指定してください。")
+
+    async def add_ac(self, i: discord.Interaction, current: str):
+        if i.user.id != OWNER:  # autocompleteには権限チェックが効かないため明示的に制限
+            return []
+        return make_choices(self.add_candidates(), current)
+
+    async def do_add(self, i: discord.Interaction, target: str):
         if not await self.guard(i): return
-        uid = extract_uid(url)
-        if not uid:
-            return await i.response.send_message(
-                tr("URLの形式が不正です。`https://vrchat.com/home/user/usr_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` を指定してください。"))
+        uid, err = self.resolve_add(target)
+        if err:
+            return await i.response.send_message(err)
         await i.response.defer()
-        try:
-            u = await self.vrc_call(self.bot.vrc.get_user, uid)
-        except Exception as e:
-            log.warning("add: get_user failed uid=%s: %r", uid, e)
-            return await i.followup.send(tr("❌ {msg}", msg=explain_error(e)))
+        known = self.bot.stats.friend(uid)
+        if known and known["is_friend"] and known["name"]:
+            u, name = None, known["name"]  # 名簿にいる人はAPI不要
+        else:  # 名簿にいない人(URL指定)は存在確認も兼ねてAPIで取得
+            try:
+                u = await self.vrc_call(self.bot.vrc.get_user, uid)
+            except Exception as e:
+                log.warning("add: get_user failed uid=%s: %r", uid, e)
+                return await i.followup.send(tr("❌ {msg}", msg=explain_error(e)))
+            name = u["name"]
         async with self.add_lock:
             existing = self.bot.db.get(uid)
             if existing and existing["active"]:
                 return await i.followup.send(tr("すでに登録済みです: **{name}** <#{ch}>", name=esc(existing["name"]), ch=existing["channel_id"]))
             try:
-                ch = await self.bot.friend_channel(uid, u["name"])
+                ch = await self.bot.friend_channel(uid, name)
             except discord.HTTPException as e:
                 log.exception("add: channel creation failed uid=%s", uid)
                 return await i.followup.send(tr("❌ チャンネル作成に失敗しました (Botの権限を確認): {status}", status=e.status))
-            self.bot.db.upsert(uid, u["name"], ch.id)
-        self.bot.seed(uid, u)
-        self.bot.stats.reconcile(uid, uid in self.bot.ingame, u["status"])
-        log.info("friend added by=%s uid=%s name=%s rejoin=%s", i.user.id, uid, u["name"], bool(existing))
-        warn = "" if u["is_friend"] else tr("\n⚠️ このアカウントとフレンドではないため、通知は届きません。")
+            self.bot.db.upsert(uid, name, ch.id)
+        warn = ""
+        if u:
+            self.bot.seed(uid, u)
+            if u["is_friend"]:
+                self.bot.note_friend(uid, name, force=True)  # 名簿に載せて、以後は全フレンドと同じく収集する
+                self.bot.stats.reconcile(uid, uid in self.bot.ingame, u["status"])
+            else:
+                warn = tr("\n⚠️ このアカウントとフレンドではないため、通知は届きません。")
+        log.info("friend added by=%s uid=%s name=%s rejoin=%s", i.user.id, uid, name, bool(existing))
         e = discord.Embed(title=tr("➕ メンバー追加") + (tr("(再登録)") if existing else ""),
-                          description=f"**{esc(u['name'])}**\n`{uid}`", color=0x2ECC71)
+                          description=f"**{esc(name)}**\n`{uid}`", color=0x2ECC71)
         try: await ch.send(embed=e)
         except discord.HTTPException: log.exception("add: failed to write log to member channel")
-        await i.followup.send(tr("✅ 追加しました: **{name}** → {ch}{warn}", name=esc(u["name"]), ch=ch.mention, warn=warn), embed=e)
+        await i.followup.send(tr("✅ 追加しました: **{name}** → {ch}{warn}", name=esc(name), ch=ch.mention, warn=warn), embed=e)
 
-    # ---------- /friend remove ----------
+    # ---------- /remove ----------
     def resolve(self, value):
         """オートコンプリート値(UID)から登録行を探す。手入力された名前も、一意なら許容。"""
         value = (value or "").strip()
@@ -569,25 +713,9 @@ class FriendCommands:
     async def remove_ac(self, i: discord.Interaction, current: str):
         if i.user.id != OWNER:  # autocompleteには権限チェックが効かないため明示的に制限
             return []
-        cur = (current or "").strip().lower()
-        out, seen = [], set()
-        for r in self.bot.db.active():
-            name = r["name"] or r["uid"]
-            if cur and cur not in name.lower() and cur not in r["uid"]:
-                continue
-            # 同名・類似名でも区別できるようUID下6桁を付ける(衝突時は12桁→連番)。valueはUID。
-            label = f"{name[:80]} (…{r['uid'][-6:]})"
-            if label in seen: label = f"{name[:70]} (…{r['uid'][-12:]})"
-            n = 1
-            while label in seen:
-                n += 1; label = f"{name[:70]} (…{r['uid'][-12:]}) #{n}"
-            seen.add(label)
-            out.append(app_commands.Choice(name=label[:100], value=r["uid"]))
-            if len(out) >= 25:  # Discordの候補上限
-                break
-        return out
+        return make_choices(self.bot.db.active(), current)
 
-    # ---------- /friend list ----------
+    # ---------- /list ----------
     async def do_list(self, i: discord.Interaction, show_uid: bool = False, include_removed: bool = False):
         if not await self.guard(i): return
         rows = self.bot.db.all() if include_removed else self.bot.db.active()
@@ -601,9 +729,9 @@ class FriendCommands:
 
     def commands(self):
         """トップレベルの /add /remove /list を返す"""
-        @app_commands.describe(url="https://vrchat.com/home/user/usr_... のURL (usr_...のIDも可)")
-        async def add(i: discord.Interaction, url: str):
-            await self.do_add(i, url)
+        @app_commands.describe(target="フレンドを選択、またはプロフィールURL (https://vrchat.com/home/user/usr_...)")
+        async def add(i: discord.Interaction, target: str):
+            await self.do_add(i, target)
 
         @app_commands.describe(target="候補から選択 (表示名の末尾はUIDの下6桁)")
         async def remove(i: discord.Interaction, target: str):
@@ -613,15 +741,18 @@ class FriendCommands:
         async def list_(i: discord.Interaction, show_uid: bool = False, include_removed: bool = False):
             await self.do_list(i, show_uid, include_removed)
 
+        add_cmd = app_commands.Command(name="add", description="フレンドを選んで(またはURLで)通知先に追加", callback=add)
         remove_cmd = app_commands.Command(name="remove", description="登録済みフレンドを削除 (チャンネルは残ります)", callback=remove)
+
+        @add_cmd.autocomplete("target")
+        async def add_autocomplete(i: discord.Interaction, current: str):
+            return await self.add_ac(i, current)
 
         @remove_cmd.autocomplete("target")
         async def remove_autocomplete(i: discord.Interaction, current: str):
             return await self.remove_ac(i, current)
 
-        return [app_commands.Command(name="add", description="VRChatプロフィールURLからフレンドを追加", callback=add),
-                remove_cmd,
-                app_commands.Command(name="list", description="登録一覧", callback=list_)]
+        return [add_cmd, remove_cmd, app_commands.Command(name="list", description="登録一覧", callback=list_)]
 
 
 if __name__ == "__main__":

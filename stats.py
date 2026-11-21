@@ -1,6 +1,7 @@
 """ログイン統計: ゲーム内ログイン/ログアウト/ステータス変更を履歴として保存し、集計する。
 
-既存の friends テーブルには触れず、専用テーブル(activity / stats_meta)を IF NOT EXISTS で追加するだけ。
+既存の friends テーブルには触れず、専用テーブル(activity / stats_meta / vrc_friends)を IF NOT EXISTS で追加するだけ。
+vrc_friends = VRChat上の全フレンドの名簿。Discordに通知する登録(friends)とは独立で、統計は名簿の全員分を記録する。
 kind: login=ゲーム内ログイン(頻度に数える) / resume=ログイン時刻不明の復元(滞在時間のみ数える)
       status=ステータス変更 / logout=ゲームから離脱
 """
@@ -32,7 +33,10 @@ class Stats:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, uid TEXT NOT NULL,
                 ts REAL NOT NULL, kind TEXT NOT NULL, status TEXT);
             CREATE INDEX IF NOT EXISTS idx_activity_uid_ts ON activity(uid, ts);
-            CREATE TABLE IF NOT EXISTS stats_meta(k TEXT PRIMARY KEY, v TEXT);""")
+            CREATE TABLE IF NOT EXISTS stats_meta(k TEXT PRIMARY KEY, v TEXT);
+            CREATE TABLE IF NOT EXISTS vrc_friends(
+                uid TEXT PRIMARY KEY, name TEXT, is_friend INTEGER NOT NULL DEFAULT 1,
+                tracked_since REAL NOT NULL, updated_at REAL);""")
         self.c.execute("INSERT OR IGNORE INTO stats_meta(k,v) VALUES('since', ?)", (str(time.time()),))
         self.c.commit()
         self.prev_alive = self._meta("alive")  # 前回プロセスが最後に生きていた時刻 (起動時の照合用)
@@ -52,6 +56,52 @@ class Stats:
             self.c.commit()
         except Exception:
             log.exception("stats heartbeat failed")
+
+    # ---------- フレンド名簿 (VRChat上の全フレンド) ----------
+    def upsert_friend(self, uid, name, hint=None):
+        """名簿に追加/更新(フレンドである印も付け直す)。新規ならTrueを返す。
+        新規の収集開始日時: 既に履歴があればその最初の時刻まで遡る。hint(Discord登録日時)があれば統計開始以降でそれを使う。"""
+        now = time.time()
+        if self.c.execute("SELECT 1 FROM vrc_friends WHERE uid=?", (uid,)).fetchone():
+            self.c.execute("UPDATE vrc_friends SET name=COALESCE(?,name), is_friend=1, updated_at=? WHERE uid=?",
+                           (name or None, now, uid))
+            self.c.commit()
+            return False
+        base = now
+        if hint:
+            base = min(now, max(hint, self.since() or hint))
+        first = self.c.execute("SELECT MIN(ts) FROM activity WHERE uid=?", (uid,)).fetchone()[0]
+        if first is not None:
+            base = min(base, first)
+        self.c.execute("INSERT INTO vrc_friends(uid,name,is_friend,tracked_since,updated_at) VALUES(?,?,1,?,?)",
+                       (uid, name or None, base, now))
+        self.c.commit()
+        return True
+
+    def mark_unfriended(self, uid):
+        self.c.execute("UPDATE vrc_friends SET is_friend=0, updated_at=? WHERE uid=?", (time.time(), uid))
+        self.c.commit()
+
+    def friend(self, uid):
+        return self.c.execute("SELECT * FROM vrc_friends WHERE uid=?", (uid,)).fetchone()
+
+    def friends(self):
+        """名簿の全員(フレンド解除済みも含む。履歴は残るため)。表示名順。"""
+        return self.c.execute("SELECT * FROM vrc_friends ORDER BY LOWER(COALESCE(name, uid)), uid").fetchall()
+
+    def missing(self, present_uids):
+        """名簿にフレンドとして載っているが、最新の一覧にいない人"""
+        present = set(present_uids)
+        return [r["uid"] for r in self.c.execute("SELECT uid FROM vrc_friends WHERE is_friend=1") if r["uid"] not in present]
+
+    def tracked_since(self, uids):
+        """uids の収集開始日時の最小値。名簿にまだ無い人は統計開始(since)として扱う。"""
+        if not uids:
+            return self.since()
+        q = ",".join("?" * len(uids))
+        have = {r["uid"]: r["tracked_since"] for r in
+                self.c.execute(f"SELECT uid, tracked_since FROM vrc_friends WHERE uid IN ({q})", list(uids))}
+        return min(have.get(u, self.since()) for u in uids)
 
     # ---------- 記録 ----------
     def record(self, uid, kind, status=None, ts=None):

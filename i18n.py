@@ -65,8 +65,8 @@ TABLES = {
         "**{name}** — 記録なし": "**{name}** — no data",
         "…他{n}人": "…and {n} more",
         "👥 フレンド別 (ログイン回数順)": "👥 By friend (by logins)",
-        "ゲーム内のログインのみ集計(Webのみは対象外)。集計開始後に登録したフレンドは登録後の分だけです。":
-            "Only in-game logins are counted (web-only activity is excluded). Friends added after tracking began are counted from the time they were added.",
+        "ゲーム内のログインのみ集計(Webのみは対象外)。フレンドごとの収集開始日時以降の分です。":
+            "Only in-game logins are counted (web-only activity is excluded). Data starts from when each friend began to be tracked.",
         # --- /remove・/list の画面部品 ---
         "所有者のみ操作できます。": "Only the owner can use this.",
         "削除する": "Remove",
@@ -81,8 +81,11 @@ TABLES = {
         "ページ {p}/{n}": "Page {p}/{n}",
         # --- /add・/remove・/list ---
         "メインチャンネルで所有者のみ実行できます。": "Only the owner can run this, and only in the main channel.",
-        "URLの形式が不正です。`https://vrchat.com/home/user/usr_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` を指定してください。":
-            "Invalid URL. Please provide `https://vrchat.com/home/user/usr_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.",
+        "該当するフレンドが見つかりません。候補から選ぶか、プロフィールURL (`https://vrchat.com/home/user/usr_...`) を指定してください。":
+            "No matching friend found. Pick one from the suggestions or provide a profile URL (`https://vrchat.com/home/user/usr_...`).",
+        "該当するフレンドが見つかりません。候補から選択してください。": "No matching friend found. Please pick one from the suggestions.",
+        " (未登録)": " (not registered)",
+        " (フレンド解除済み)": " (unfriended)",
         "❌ {msg}": "❌ {msg}",
         "すでに登録済みです: **{name}** <#{ch}>": "Already registered: **{name}** <#{ch}>",
         "❌ チャンネル作成に失敗しました (Botの権限を確認): {status}": "❌ Failed to create the channel (check the bot's permissions): {status}",
@@ -137,7 +140,7 @@ def set_lang(code):
     _lang = code
 
 
-def tr(msg, **kw):
+def tr(msg, /, **kw):  # 第1引数は位置専用 (書式に {msg} という名前の引数を渡せるように)
     """日本語の文を現在の言語に翻訳して .format する。表に無ければ日本語のまま。"""
     s = TABLES.get(_lang, {}).get(msg, msg)
     try:

@@ -160,7 +160,11 @@ s.reconcile("I", False, None); assert s.state("I") == (False, None, None)       
 
 # --- イベント -> 記録 / コマンド ---
 class FI:
-    def __init__(s, uid, ch): s.user = types.SimpleNamespace(id=uid); s.channel_id = ch; s.out = None; s.response = types.SimpleNamespace(send_message=s._send, edit_message=s._edit)
+    def __init__(s, uid, ch):
+        s.user = types.SimpleNamespace(id=uid); s.channel_id = ch; s.out = None
+        s.response = types.SimpleNamespace(send_message=s._send, edit_message=s._edit, defer=s._defer)
+        s.followup = types.SimpleNamespace(send=s._send)
+    async def _defer(s, **kw): pass
     async def _send(s, content=None, **kw): s.out = (content, kw)
     async def _edit(s, **kw): s.out = ("edit", kw)
 def kinds(st, uid): return [(r["kind"], r["status"]) for r in st.c.execute("SELECT kind,status FROM activity WHERE uid=? ORDER BY ts,id", (uid,))]
@@ -206,16 +210,16 @@ async def run4():
     i = FI(99, 2); await cb(i, None); e = i.out[1]["embed"]
     assert all(len(x.value) <= 1024 for x in e.fields) and len(e) <= 6000 and len(e.description) <= 4096, (len(e), [len(x.value) for x in e.fields])
     assert "…他" in [x.value for x in e.fields if x.name.startswith("👥")][0]
-    # 削除: ゲーム内区間を閉じる / 起動時の照合
+    # 削除(通知を止める)してもデータ収集は続く: ゲーム内状態は閉じない
     bot.stats.record("usr_a", "login", "active"); bot.ingame.add("usr_a")
     view = B.ConfirmRemove(bot, bot.db.get("usr_a")); await view.yes.callback(FI(99, 2))
-    assert bot.stats.state("usr_a")[0] is False and "usr_a" not in bot.ingame
+    assert bot.db.get("usr_a")["active"] == 0 and bot.stats.state("usr_a")[0] is True and "usr_a" in bot.ingame
+    # 起動時の最初の同期: 停止中にゲームを抜けていた人は、前回の生存時刻で閉じる
     bot.db.upsert("usr_a", "Alice", 111); bot.stats.c.execute("DELETE FROM activity WHERE uid='usr_a'"); bot.stats.c.commit()
-    bot.stats.record("usr_a", "login", "busy", T(1, 20)); bot.stats.prev_alive = T(1, 21)
-    bot.vrc.get_user = lambda u: {"name": "x", "status": "active", "desc": "", "is_friend": True, "state": "active"}
-    for n in range(40): bot.db.deactivate(f"usr_{n:02d}")
-    bot.db.deactivate("usr_b"); await bot.prime_cache()                                                 # 停止中にゲームを抜けていた
-    assert bot.stats.state("usr_a")[0] is False and bot.stats.state("usr_a")[2] == T(1, 21)
+    bot.stats.record("usr_a", "login", "busy", T(1, 20)); bot.stats.prev_alive = T(1, 21); bot.ingame.add("usr_a")
+    bot.vrc.get_friends_all = lambda: [{"uid": "usr_a", "name": "Alice", "status": "active", "desc": "", "location": "offline", "ingame": False}]
+    await bot.sync_friends()
+    assert bot.stats.state("usr_a")[0] is False and bot.stats.state("usr_a")[2] == T(1, 21) and "usr_a" not in bot.ingame
 asyncio.run(run4())
 
 # --- スラッシュコマンド定義 ---
@@ -251,6 +255,7 @@ assert not [k for k in EN if k not in keys], [k for k in EN if k not in keys]   
 i18n.set_lang("en")
 assert i18n.tr("{name} (グループ)", name="G") == "G (Group)" and i18n.tr("表に無い日本語") == "表に無い日本語"
 assert i18n.tr("{name} (グループ)") == "{name} (Group)"      # 引数なしは未整形のまま返す(例外にしない)
+assert i18n.tr("❌ {msg}", msg="boom") == "❌ boom"               # {msg} という名前の書式引数も渡せる(以前は例外になっていた)
 assert i18n.tr("{name} (グループ)", wrong=1) == "{name} (グループ)"   # 引数名が違っても例外にせず原文で返す(通知を止めない)
 try: i18n.set_lang("xx"); raise SystemExit("unsupported lang accepted")
 except ValueError: pass
@@ -433,7 +438,7 @@ async def run8():
     d = {x.name: x.to_dict(tree) for x in tree.get_commands(guild=discord.Object(1))}
     assert all(x["type"] == 1 and len(x["description"]) <= 100 for x in d.values())
     assert not any(o["type"] in (1, 2) for x in d.values() for o in x.get("options", []))            # サブコマンド/サブコマンドグループなし
-    assert [o["name"] for o in d["add"]["options"]] == ["url"] and d["add"]["options"][0]["required"] is True
+    assert [o["name"] for o in d["add"]["options"]] == ["target"] and d["add"]["options"][0]["required"] is True and d["add"]["options"][0]["autocomplete"] is True
     assert [(o["name"], o["type"]) for o in d["list"]["options"]] == [("show_uid", 5), ("include_removed", 5)]
     assert d["remove"]["options"][0]["name"] == "target" and d["remove"]["options"][0]["autocomplete"] is True
     # setup_hook が全部登録している / グループ方式に戻っていない
@@ -450,6 +455,236 @@ async def run8():
         for who, ch in ((99, 999), (1, 2)):
             i = FI(who, ch); await call(i); assert i.out[1].get("ephemeral") and "メインチャンネルで所有者のみ" in i.out[0], (who, ch)
     i = FI(99, 2); await fc.do_list(i); assert "Alice" in i.out[1]["embed"].description         # 正規の場所なら動く
-    i = FI(99, 2); await fc.do_add(i, "not-a-url"); assert "URLの形式が不正" in i.out[0]
+    i = FI(99, 2); await fc.do_add(i, "not-a-url"); assert "該当するフレンドが見つかりません" in i.out[0]
 asyncio.run(run8())
 print("COMMAND TESTS PASSED")
+
+# ================= 全フレンドの収集 (vrc_friends) =================
+UU = lambda n: f"usr_{n:08x}-1111-1111-1111-111111111111"
+def fr(uid_, name, ingame=False, status="active", loc=None, desc=""):
+    return {"uid": uid_, "name": name, "status": status, "desc": desc, "location": loc or ("wrld_x:1~region(jp)" if ingame else "offline"), "ingame": ingame}
+class FakeVRC3:
+    def __init__(s): s.list, s.fail, s.users, s.calls = [], False, {}, {"world": 0, "instance": 0, "user": 0}
+    def get_friends_all(s):
+        if s.fail: raise RuntimeError("boom")
+        return list(s.list)
+    def get_world(s, w): s.calls["world"] += 1; return {"name": "W", "author": "a", "capacity": 32, "thumb": None, "desc": ""}
+    def get_instance(s, w, i): s.calls["instance"] += 1; return {"n_users": 3, "capacity": 16}
+    def get_user(s, u):
+        s.calls["user"] += 1
+        if isinstance(s.users[u], Exception): raise s.users[u]
+        return s.users[u]
+    def get_group_name(s, g): return "G"
+def newbot():
+    bot = B.Bot(); bot.db = DB(":memory:"); bot.stats = Stats(bot.db.c, JST); bot.vrc = FakeVRC3()
+    bot.stats.c.execute("UPDATE stats_meta SET v=? WHERE k='since'", (str(T(1)),)); bot.stats.c.commit()
+    return bot
+
+# --- 名簿と収集開始日時 ---
+s = mkstats()
+assert s.upsert_friend("n1", "New") is True and abs(s.friend("n1")["tracked_since"] - time.time()) < 5   # 新規は今から
+assert s.upsert_friend("n1", "New2") is False and s.friend("n1")["name"] == "New2"
+assert s.upsert_friend("n1", None) is False and s.friend("n1")["name"] == "New2"                         # Noneでは名前を消さない
+s.record("h1", "login", "active", T(3, 10)); s.upsert_friend("h1", "Hist"); assert s.friend("h1")["tracked_since"] == T(3, 10)   # 既存の履歴まで遡る
+s.upsert_friend("h2", "A", hint=T(1) - 86400); assert s.friend("h2")["tracked_since"] == T(1)           # 登録日時が統計開始より前なら統計開始
+s.upsert_friend("h3", "B", hint=T(4)); assert s.friend("h3")["tracked_since"] == T(4)                    # 後なら登録日時
+s.record("h4", "login", "busy", T(3)); s.upsert_friend("h4", "C", hint=T(5)); assert s.friend("h4")["tracked_since"] == T(3)  # 履歴と登録日時は早いほう
+assert s.tracked_since(["h3", "h2"]) == T(1) and s.tracked_since(["h3"]) == T(4) and s.tracked_since(["zz"]) == T(1) and s.tracked_since([]) == T(1)
+s.mark_unfriended("h3"); assert s.friend("h3")["is_friend"] == 0 and "h3" in [r["uid"] for r in s.friends()]   # 解除しても名簿(履歴)は残る
+assert sorted(s.missing(["n1"])) == ["h1", "h2", "h4"]
+assert s.upsert_friend("h3", "B") is False and s.friend("h3")["is_friend"] == 1                           # 再びフレンドに
+
+# --- 一覧の取得(ページ送り・重複除去・ゲーム内判定) ---
+class FakeFriendsApi:
+    def __init__(s): s.calls = []
+    def get_friends(s, offset=0, n=100, offline=False):
+        s.calls.append((offset, n, offline))
+        mk = lambda i, loc: types.SimpleNamespace(id=f"usr_{i}", display_name=f"N{i}", status="join me", status_description="d", location=loc)
+        allf = [mk(i, "wrld_a:1" if i % 2 else "private") for i in range(120)] if not offline else [mk(1000 + i, "offline") for i in range(100)] + [mk(5, "offline")]
+        return allf[offset:offset + n]
+_v = B.VRC("u", "p", "ua"); _v.friends = FakeFriendsApi()
+_sm = sys.modules[explain_error.__module__]; _old_sleep = _sm.time.sleep; _sm.time.sleep = lambda x: None
+try: _out = _v.get_friends_all()
+finally: _sm.time.sleep = _old_sleep
+assert _v.friends.calls == [(0, 100, False), (100, 100, False), (0, 100, True), (100, 100, True)], _v.friends.calls
+assert len(_out) == 220 and len({f["uid"] for f in _out}) == 220 and sum(f["ingame"] for f in _out) == 120   # 重複(usr_5)は除く
+assert next(f for f in _out if f["uid"] == "usr_5")["ingame"] is True and _out[0]["status"] == "join me" and _out[0]["desc"] == "d"
+
+# --- 同期とイベント: 全員を記録し、通知は登録者だけ ---
+async def run9():
+    bot = newbot(); sent = []
+    async def fake_send(uid_, **kw): sent.append((uid_, kw["embed"].title, kw.get("content")))
+    bot.send_to = fake_send
+    bot.db.upsert("usr_a", "OldA", 111)                                           # 登録済み(名前が古い)
+    bot.vrc.list = [fr("usr_a", "Alice", True, "join me", "wrld_x:1~region(jp)"), fr("usr_b", "Bob", True, "busy", "private"),
+                    fr("usr_c", "Carol"), fr("usr_t", "Trav", True, loc="traveling")]
+    await bot.sync_friends()
+    assert {r["uid"] for r in bot.stats.friends()} == {"usr_a", "usr_b", "usr_c", "usr_t"}
+    assert bot.db.get("usr_a")["name"] == "Alice"                                 # 登録済みの表示名も同期
+    assert bot.ingame == {"usr_a", "usr_b", "usr_t"} and bot.last_status["usr_b"] == ("busy", "")
+    assert bot.last_loc["usr_a"] == "wrld_x:1~region(jp)" and "usr_t" not in bot.last_loc
+    assert kinds(bot.stats, "usr_a") == [("resume", "join me")] and kinds(bot.stats, "usr_c") == []
+    assert sent == [] and bot.vrc.calls == {"world": 0, "instance": 0, "user": 0}   # 同期は通知もワールドAPIもなし
+    assert bot.first_sync is False and bot.ws_down_at is None
+    ev = lambda t, u, **c: bot.handle({"type": t, "content": {"userId": u, **c}})
+    # 未登録のBob: 統計は記録するが、通知もワールドAPIもなし
+    await ev("friend-offline", "usr_b"); await ev("friend-online", "usr_b", platform="android", location="wrld_x:2", user={"status": "join me"})
+    await ev("friend-update", "usr_b", user={"status": "ask me", "statusDescription": ""}); await ev("friend-location", "usr_b", location="wrld_y:3")
+    assert kinds(bot.stats, "usr_b") == [("resume", "busy"), ("logout", None), ("login", "join me"), ("status", "ask me")], kinds(bot.stats, "usr_b")
+    assert sent == [] and bot.vrc.calls == {"world": 0, "instance": 0, "user": 0}
+    # 登録済みのAliceは従来どおり通知(オンラインはメンション付き)
+    await ev("friend-offline", "usr_a"); assert sent[-1][1] == "⚫ Alice がオフライン"
+    await ev("friend-online", "usr_a", platform="android", location="private", user={"status": "active"})
+    assert sent[-1][1] == "🟢 Alice がオンライン" and sent[-1][2] == f"<@{B.OWNER}>"
+    # 削除(通知停止)後も記録は続き、通知は出ない
+    bot.db.deactivate("usr_a"); n = len(sent)
+    await ev("friend-offline", "usr_a"); await ev("friend-online", "usr_a", platform="android", location="private", user={"status": "busy"})
+    assert len(sent) == n and kinds(bot.stats, "usr_a")[-2:] == [("logout", None), ("login", "busy")]
+    # フレンド追加/解除/改名
+    await ev("friend-add", "usr_e", user={"displayName": "Eve"}); assert bot.stats.friend("usr_e")["name"] == "Eve" and bot.stats.friend("usr_e")["is_friend"] == 1
+    await ev("friend-online", "usr_e", platform="windows", location="private", user={"displayName": "Eve", "status": "active"}); assert "usr_e" in bot.ingame
+    await ev("friend-delete", "usr_e"); assert bot.stats.friend("usr_e")["is_friend"] == 0 and "usr_e" not in bot.ingame and kinds(bot.stats, "usr_e")[-1][0] == "logout"
+    await ev("friend-update", "usr_b", user={"displayName": "Bobby", "status": "ask me", "statusDescription": ""}); assert bot.stats.friend("usr_b")["name"] == "Bobby"
+    await ev("friend-update", "usr_a", user={"displayName": "Alicia", "status": "busy"}); assert bot.db.get("usr_a")["name"] == "Alicia"   # 登録側の表示名にも反映
+    await ev("friend-add", "usr_f", user={}); assert bot.stats.friend("usr_f")["name"] is None                                          # 名前不明でも名簿に載る
+asyncio.run(run9())
+
+# --- 再同期: 見えていなかった間の離脱・解除・安全弁・排他 ---
+async def run10():
+    bot = newbot()
+    for n in range(10): bot.stats.upsert_friend(UU(n), f"F{n}")
+    bot.stats.record(UU(1), "login", "active", T(1, 20)); bot.ingame.add(UU(1))
+    bot.stats.record(UU(2), "login", "busy", T(1, 20)); bot.ingame.add(UU(2))
+    base = [fr(UU(n), f"F{n}") for n in range(10)]
+    # 同期が失敗しても first_sync / ws_down_at を持ち越し、成功した最初の同期は前回の生存時刻で閉じる
+    bot.first_sync, bot.stats.prev_alive, bot.ws_down_at = True, T(1, 21), T(1, 23)
+    bot.vrc.fail = True; await bot.sync_friends(); assert bot.first_sync is True and bot.ws_down_at == T(1, 23)
+    bot.vrc.fail = False; bot.vrc.list = base; await bot.sync_friends()
+    assert bot.stats.state(UU(1))[2] == T(1, 21) and bot.stats.state(UU(1))[0] is False and bot.first_sync is False and bot.ws_down_at is None
+    # 2回目以降は WebSocket が切れた時刻で閉じる
+    assert bot.stats.state(UU(2))[2] == T(1, 21)                                                  # (1回目で閉じ済み)
+    bot.stats.record(UU(4), "login", "active", T(1, 20)); bot.ingame.add(UU(4)); bot.ws_down_at = T(1, 22); await bot.sync_friends()
+    assert bot.stats.state(UU(4))[0] is False and bot.stats.state(UU(4))[2] == T(1, 22) and bot.ws_down_at is None
+    # 一覧から消えた人(少数)はフレンド解除として扱い、ゲーム内なら閉じる
+    bot.stats.record(UU(3), "login", "active", T(1, 20)); bot.ingame.add(UU(3))
+    bot.vrc.list = [f for f in base if f["uid"] != UU(3)]; await bot.sync_friends()
+    assert bot.stats.friend(UU(3))["is_friend"] == 0 and UU(3) not in bot.ingame and bot.stats.state(UU(3))[0] is False
+    # 取得不全で大量に消えたように見えたら解除扱いにしない(安全弁)
+    for n in range(10, 30): bot.stats.upsert_friend(UU(n), f"F{n}")
+    bot.vrc.list = base[:10]; await bot.sync_friends()
+    assert all(bot.stats.friend(UU(n))["is_friend"] == 1 for n in range(10, 30))
+    # 同期中の二重実行は無視
+    await bot.sync_lock.acquire(); calls = []; bot.vrc.get_friends_all = lambda: calls.append(1) or []
+    await bot.sync_friends(); bot.sync_lock.release(); assert calls == []
+asyncio.run(run10())
+
+# --- /add: 名簿から選ぶ / URL ---
+async def run11():
+    bot = newbot(); created = []
+    async def ch_send(**kw): pass
+    async def fake_channel(u, name): created.append((u, name)); return types.SimpleNamespace(id=900 + len(created), mention=f"<#{900 + len(created)}>", send=ch_send)
+    bot.friend_channel = fake_channel; fc = B.FriendCommands(bot)
+    for n, name in ((1, "Alice"), (2, "Bob"), (3, "Zed"), (4, "Gone"), (5, "Reg")): bot.stats.upsert_friend(UU(n), name)
+    bot.stats.mark_unfriended(UU(4)); bot.db.upsert(UU(5), "Reg", 555)
+    assert {r["uid"] for r in fc.add_candidates()} == {UU(1), UU(2), UU(3)}                      # 解除済み・登録済みは候補に出ない
+    r = await fc.add_ac(FI(99, 2), "ali"); assert [(x.name.split(" ")[0], x.value) for x in r] == [("Alice", UU(1))]
+    assert len(await fc.add_ac(FI(99, 2), "")) == 3 and await fc.add_ac(FI(1, 2), "") == []
+    i = FI(99, 2); await fc.do_add(i, UU(1))                                                     # 名簿の人はAPI不要
+    assert bot.vrc.calls["user"] == 0 and created == [(UU(1), "Alice")] and bot.db.get(UU(1))["active"] == 1
+    assert "追加しました" in i.out[0] and "Alice" in i.out[0] and "⚠️" not in i.out[0]
+    assert UU(1) not in [r["uid"] for r in fc.add_candidates()]
+    i = FI(99, 2); await fc.do_add(i, UU(1)); assert "すでに登録済み" in i.out[0]
+    i = FI(99, 2); await fc.do_add(i, " bob "); assert bot.db.get(UU(2)) and bot.vrc.calls["user"] == 0   # 名前の完全一致(一意)
+    bot.stats.upsert_friend(UU(8), "Dup"); bot.stats.upsert_friend(UU(9), "dup")
+    i = FI(99, 2); await fc.do_add(i, "DUP"); assert "同名" in i.out[0] and bot.db.get(UU(8)) is None
+    i = FI(99, 2); await fc.do_add(i, "nobody"); assert "該当するフレンドが見つかりません" in i.out[0]
+    i = FI(99, 2); await fc.do_add(i, f"https://vrchat.com/home/user/{UU(3)}"); assert bot.db.get(UU(3)) and bot.vrc.calls["user"] == 0   # URLでも名簿の人はAPI不要
+    # 名簿にいない人(URL): APIで確認 -> フレンドなら名簿に載せる / フレンドでなければ警告 / 存在しなければエラー
+    bot.vrc.users[UU(20)] = {"name": "Zoe", "status": "active", "desc": "", "is_friend": True, "state": "offline"}
+    bot.vrc.users[UU(21)] = {"name": "Stranger", "status": "active", "desc": "", "is_friend": False, "state": "offline"}
+    bot.vrc.users[UU(22)] = E(404)
+    i = FI(99, 2); await fc.do_add(i, f"https://vrchat.com/home/user/{UU(20)}")
+    assert bot.vrc.calls["user"] == 1 and bot.db.get(UU(20))["name"] == "Zoe" and bot.stats.friend(UU(20))["is_friend"] == 1 and "⚠️" not in i.out[0]
+    i = FI(99, 2); await fc.do_add(i, UU(21)); assert "⚠️" in i.out[0] and bot.stats.friend(UU(21)) is None and bot.db.get(UU(21))["active"] == 1
+    i = FI(99, 2); await fc.do_add(i, UU(22)); assert "存在しません" in i.out[0] and bot.db.get(UU(22)) is None
+    # 削除した人は再登録できる(候補に戻り、チャンネルは再利用)
+    bot.db.deactivate(UU(1)); assert UU(1) in [r["uid"] for r in fc.add_candidates()]
+    i = FI(99, 2); await fc.do_add(i, UU(1)); assert "(再登録)" in i.out[1]["embed"].title
+asyncio.run(run11())
+
+# --- /stats who: 登録の有無に関係なく収集済みのデータで分析 ---
+async def run12():
+    bot = newbot(); R_, A_, B_, U_, L_ = UU(1), UU(2), UU(3), UU(4), UU(5)   # 削除済み/登録中/未登録/解除済み/名簿に無い登録済み
+    bot.db.upsert(A_, "Alice", 111); bot.db.upsert(R_, "Removed", 222); bot.db.deactivate(R_); bot.db.upsert(L_, "Legacy", 555)
+    for u, n in ((A_, "Alice"), (R_, "Removed"), (B_, "Bob"), (U_, "Unfr")): bot.stats.upsert_friend(u, n)
+    bot.stats.mark_unfriended(U_)
+    bot.stats.c.execute("UPDATE vrc_friends SET tracked_since=?", (T(4),)); bot.stats.c.commit()   # 収集開始は全員4日目(履歴はその後)
+    for u, k in ((A_, 2), (R_, 3), (B_, 5), (U_, 7)):
+        for d in range(k): bot.stats.record(u, "login", "active", T(5 + d // 4, 8 + 3 * (d % 4))); bot.stats.record(u, "logout", None, T(5 + d // 4, 9 + 3 * (d % 4)))   # 5〜6日目(過去)に収める
+    cmd = bot.make_stats_command(); cb = cmd.callback
+    fmt = lambda ts: datetime.fromtimestamp(ts, JST).strftime("%Y-%m-%d %H:%M")
+    i = FI(99, 2); await cb(i, None, None); e = i.out[1]["embed"]
+    assert "**ゲーム内ログイン**: 2回" in e.description and "全員" in e.title                       # 省略時は登録中の全員(未登録・削除済みは含めない)
+    for who, n, tags in ((B_, 5, [" (未登録)"]), (R_, 3, [" (削除済み)"]), (U_, 7, [" (未登録)", " (フレンド解除済み)"]), (A_, 2, [])):
+        i = FI(99, 2); await cb(i, None, who); e = i.out[1]["embed"]
+        assert f"**ゲーム内ログイン**: {n}回" in e.description and all(t in e.title for t in tags), (who, e.title, e.description)
+        assert not any(x.name.startswith("👥") for x in e.fields)
+    i = FI(99, 2); await cb(i, None, B_); assert fmt(T(4)) in i.out[1]["embed"].description         # 期間の開始はそのフレンドの収集開始日時
+    i = FI(99, 2); await cb(i, 1, B_); d = i.out[1]["embed"].description; assert "約1.0日間" in d and "**ゲーム内ログイン**: 0回" in d   # days併用
+    i = FI(99, 2); await cb(i, None, "bob"); assert "Bob" in i.out[1]["embed"].title               # 名前でも指定できる
+    i = FI(99, 111); await cb(i, None, B_); assert "Bob" in i.out[1]["embed"].title                # フレンド用チャンネルでもwho優先
+    i = FI(99, 111); await cb(i, None, None); assert "Alice" in i.out[1]["embed"].title            # whoなしは従来どおりそのチャンネルのフレンド
+    i = FI(99, 222); await cb(i, None, None); assert "(削除済み)" in i.out[1]["embed"].title
+    i = FI(99, 2); await cb(i, None, L_); assert "Legacy" in i.out[1]["embed"].title                # 名簿に無い登録済みの人も指定できる
+    i = FI(99, 2); await cb(i, None, "nobody"); assert i.out[1].get("ephemeral") and "該当するフレンドが見つかりません" in i.out[0]
+    i = FI(99, 2); await cb(i, None, UU(99)); assert i.out[1].get("ephemeral")
+    bot.stats.upsert_friend(UU(8), "Same"); bot.stats.upsert_friend(UU(9), "same")
+    i = FI(99, 2); await cb(i, None, "SAME"); assert "同名" in i.out[0]
+    i = FI(1, 2); await cb(i, None, B_); assert i.out[1].get("ephemeral") and "所有者" in i.out[0]   # 他人は不可
+    ac = cmd._params["who"].autocomplete                                                            # 候補: 登録中/削除済み/未登録/解除済み/名簿外の登録済み
+    r = await ac(FI(99, 2), ""); assert {x.value for x in r} >= {A_, R_, B_, U_, L_} and await ac(FI(1, 2), "") == []
+    r = await ac(FI(99, 2), "unf"); assert [(x.name.split(" ")[0], x.value) for x in r] == [("Unfr", U_)]
+    # スラッシュコマンド定義
+    tree = app_commands.CommandTree(discord.Client(intents=discord.Intents.default())); tree.add_command(cmd, guild=discord.Object(1))
+    o = {x["name"]: x for x in cmd.to_dict(tree)["options"]}
+    assert o["days"]["type"] == 4 and not o["days"].get("required") and o["days"]["min_value"] == 1
+    assert o["who"]["type"] == 3 and not o["who"].get("required") and o["who"]["autocomplete"] is True and list(o) == ["days", "who"]
+asyncio.run(run12())
+assert i18n.get_lang() == "ja"
+print("COLLECT TESTS PASSED")
+
+# --- WebSocketの配線: 接続のたびに同期 / 切断時刻の記録 / 再接続 (偽の接続で確認) ---
+async def run13():
+    bot = newbot(); syncs, handled, conns = [], [], []
+    async def fake_sync(): syncs.append(1)
+    async def fake_handle(m): handled.append(m["type"])
+    bot.sync_friends, bot.handle = fake_sync, fake_handle
+    bot.vrc.get_token = lambda: "tok"
+    class WS:
+        def __init__(s, n): s.n, s.k = n, 0
+        async def __aenter__(s): return s
+        async def __aexit__(s, *a): return False
+        def __aiter__(s): return s
+        async def __anext__(s):
+            s.k += 1
+            if s.k == 1: return json.dumps({"type": "friend-offline", "content": {"userId": "usr_a"}})
+            if s.n == 1: raise ConnectionError("drop")      # 1回目の接続は途中で切れる
+            await real_sleep(3600)                           # 2回目は維持
+    def fake_connect(url, additional_headers=None): conns.append(url); return WS(len(conns))
+    real_connect, real_sleep = B.websockets.connect, asyncio.sleep
+    async def fast_sleep(x): await real_sleep(0 if x < 100 else x)   # 再接続の待ちだけ短縮
+    B.websockets.connect, asyncio.sleep = fake_connect, fast_sleep
+    try:
+        assert bot.ws_down_at is None
+        task = asyncio.create_task(bot.ws_loop())
+        for _ in range(100):
+            await real_sleep(0.01)
+            if len(conns) >= 2 and len(syncs) >= 2: break
+        task.cancel()
+    finally:
+        B.websockets.connect, asyncio.sleep = real_connect, real_sleep
+    assert conns == ["wss://pipeline.vrchat.cloud/?authToken=tok"] * 2                  # 切断後に再接続した
+    assert len(syncs) == 2 and handled == ["friend-offline", "friend-offline"]          # 接続のたびに同期 / イベントは処理
+    assert bot.ws_down_at is not None and time.time() - bot.ws_down_at < 30             # 切断時刻を記録(次の同期で使う)
+asyncio.run(run13())
+print("WS TESTS PASSED")

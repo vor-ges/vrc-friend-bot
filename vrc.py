@@ -1,7 +1,7 @@
-import os, re, asyncio, vrchatapi
+import os, re, time, asyncio, vrchatapi
 from urllib.parse import urlparse
 from i18n import tr
-from vrchatapi.api import authentication_api, users_api, worlds_api, instances_api, groups_api
+from vrchatapi.api import authentication_api, users_api, worlds_api, instances_api, groups_api, friends_api
 from vrchatapi.exceptions import UnauthorizedException
 from vrchatapi.models.two_factor_auth_code import TwoFactorAuthCode
 from vrchatapi.models.two_factor_email_code import TwoFactorEmailCode
@@ -60,6 +60,7 @@ class VRC:
         self.worlds = worlds_api.WorldsApi(self.api)
         self.instances = instances_api.InstancesApi(self.api)
         self.groups = groups_api.GroupsApi(self.api)
+        self.friends = friends_api.FriendsApi(self.api)
         self.token = None
 
     def login(self):
@@ -116,3 +117,25 @@ class VRC:
 
     def get_group_name(self, gid):
         return self.groups.get_group(gid).name
+
+    def get_friends_all(self):
+        """このアカウントのフレンド全員(オンライン側+オフライン側)を、100件ずつ取得して返す。
+        現在地が offline 以外ならゲーム内(ingame)。Webだけの人は location が offline なのでゲーム内にならない。"""
+        out, seen = [], set()
+        for offline in (False, True):
+            offset = 0
+            while True:
+                page = self.friends.get_friends(offset=offset, n=100, offline=offline)
+                for f in page:
+                    if f.id in seen:
+                        continue
+                    seen.add(f.id)
+                    loc = f.location or "offline"
+                    out.append({"uid": f.id, "name": f.display_name, "status": str(f.status or ""),
+                                "desc": f.status_description or "", "location": loc, "ingame": loc != "offline"})
+                if len(page) < 100:
+                    break
+                offset += 100
+                time.sleep(0.5)  # レート制限に配慮
+            time.sleep(0.5)
+        return out
